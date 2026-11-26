@@ -192,7 +192,7 @@ def _cref_from_codes(E, dom, T, coded_r, st_cols, cols, mask, tab16):
 
 # ---------------------------------------------------------------- public API
 def _compress_hybrid(coords, aatype, atom_mask, chain_index, chain_break, bound=0.1, backbone="mean", full_predictor=False,
-                     extra=None, extra_cls=None, threads=4, return_info=False, _keep_rec=False, coder="ac", residuals=True):
+                     extra=None, extra_cls=None, threads=4, return_info=False, _keep_rec=False, coder="ac", residuals=True, angle_model="mean"):
     """coords [T,R,14,3] (Angstrom); bound in Angstrom or 0 / 'lossless'; backbone 'mean' (default) or 'ae' (experimental);
     full_predictor: rotamer codes + per trajectory MLP (report mode). Returns bytes (and a size breakdown if return_info)."""
     E = _env(threads); RCD, RE, FT, RC, S, m = E["RCD"], E["RE"], E["FT"], E["RC"], E["S"], E["m"]
@@ -223,6 +223,11 @@ def _compress_hybrid(coords, aatype, atom_mask, chain_index, chain_break, bound=
     pm_bbo = np.einsum("na,tba->tnb", Mbbo32.astype(np.float64), Rq) + t32.astype(np.float64)[:, None]
     # per trajectory buffers of the shared model (reference backbone, scale, static chi prior)
     E["fit_buffers"](dom, X, FT.builder)
+    if angle_model != "mean":  # static chi prior from circular statistics (md_compress/angles.py); the decoder reads it from the stream
+        from md_compress import angles as ANG
+        tchi, cmk = FT.builder.chis_from_atom14(X, dom.aatype)
+        can = E["L"].canonicalize_chi(tchi, dom.aatype).numpy(); per = E["L"].tables()["chi_pi_periodic"][dom.aatype].numpy() > 0
+        dom.chi_ref = torch.as_tensor(ANG.chi_prior(can, dom.chi_mask.numpy() > 0, per, angle_model))
     side0 = 0
     if backbone == "mean" or Mx:
         W.arr(Mbbo32 if backbone == "mean" else Mbbo32[n_bb:], np.float32); W.arr(q, np.float32); W.arr(t32, np.float32)
@@ -405,7 +410,7 @@ HYBRID = ("hybrid", "hybrid-ae", "model-only")
 
 def _fns(MT):
     return {k: (getattr(MT, f"enc_{k.replace('-', '')}"), getattr(MT, f"dec_{k.replace('-', '')}"))
-            for k in ("xtc", "tng", "mdcompress", "trr", "dcd", "netcdf", "pdb", "h5md", "pcazip", "compresstraj", "cg2all") if hasattr(MT, f"enc_{k}")}
+            for k in ("xtc", "tng", "mdcompress", "trr", "dcd", "netcdf", "pdb", "h5md", "pcazip", "compresstraj", "cg2all", "dvorak", "mdz") if hasattr(MT, f"enc_{k}")}
 
 
 def _encode_method(method, x, cls, bound, threads, opts, topo=None):
@@ -481,15 +486,15 @@ def compress(coords, aatype, atom_mask, chain_index, chain_break, bound=None, ba
     x_truth = np.concatenate([np.asarray(coords, np.float32)[:, mk0]] + ([np.asarray(extra, np.float32)] if Mx0 else []), 1)
     groups = RP.groups_atom14(atom_mask, Mx0)
     if method in HYBRID:
-        coder = opts.pop("coder", None) or "ac"; residuals = opts.pop("residuals", True)
+        coder = opts.pop("coder", None) or "ac"; residuals = opts.pop("residuals", True); angle_model = opts.pop("angle_model", None) or "mean"
         if opts: raise TypeError(f"{method} takes no options {sorted(opts)}")
         if method == "hybrid-ae": backbone = "ae"
         if method == "model-only": backbone, full_predictor, residuals = "ae", True, False
         r = _compress_hybrid(coords, aatype, atom_mask, chain_index, chain_break, 0.1 if bound is None else bound, backbone, full_predictor,
-                             extra, extra_cls, threads, True, _keep_rec, coder, residuals)
+                             extra, extra_cls, threads, True, _keep_rec, coder, residuals, angle_model)
         out, info = r
         info["method"] = method
-        info["options"] = dict(backbone=backbone, full_predictor=bool(full_predictor), coder=coder, residuals=bool(residuals))
+        info["options"] = dict(backbone=backbone, full_predictor=bool(full_predictor), coder=coder, residuals=bool(residuals), angle_model=angle_model)
         if metadata:
             out, info = _metadata(out, info, method, x_truth, groups, len(aatype), time.time() - t0, threads, measure, _input, residuals)
         return (out, info) if return_info else out
@@ -571,13 +576,14 @@ def _decompress_core(blob, threads=4):
 
 
 # ---------------------------------------------------------------- files and CLI
-OPTS = {"hybrid": ("coder", "residuals"), "hybrid-ae": ("coder",), "model-only": (), "xtc": ("xtc_precision",), "tng": ("tng_precision",),
+OPTS = {"hybrid": ("coder", "residuals", "angle_model"), "hybrid-ae": ("coder", "angle_model"), "model-only": ("angle_model",), "xtc": ("xtc_precision",), "tng": ("tng_precision",),
         "mdcompress": ("mdc_res", "mdc_level", "mdc_preset", "mdc_batch", "mdc_history"), "new-coder": ("nc_predictor", "nc_coder"),
         "lzma": ("level", "delta"), "zstd": ("level", "delta"), "bz2": ("level", "delta"), "gzip": ("level", "delta"),
         "trr": ("trr_double",), "dcd": (), "netcdf": (), "pdb": ("pdb_precision", "pdb_gzip"),
         "h5md": ("h5md_compression", "h5md_level", "h5md_chunk", "h5md_sz3_abs"),
         "pcazip": ("pca_variance", "pca_components", "pca_residual_scale", "pca_eigenvector_scale", "pca_entropy", "pca_frame"),
-        "compresstraj": ("ct_compression", "ct_latent", "ct_epochs", "ct_layers", "ct_batch"), "cg2all": ("cg_model", "cg_precision", "cg_device", "cg_store")}
+        "compresstraj": ("ct_compression", "ct_latent", "ct_epochs", "ct_layers", "ct_batch"), "cg2all": ("cg_model", "cg_precision", "cg_device", "cg_store"),
+        "dvorak": ("dv_qr", "dv_qa", "dv_qc", "dv_cutoff"), "mdz": ("mdz_batch", "mdz_predictor", "mdz_quantbins")}
 
 
 def _load_atoms(top, traj, atoms="protein", **kw):
@@ -696,6 +702,8 @@ def main(argv=None):
     c.add_argument("--full-predictor", action="store_true", help="hybrid: rotamer codes + per trajectory MLP (report mode)")
     g = c.add_argument_group("hybrid"); g.add_argument("--coder", choices=["ac", "lzma"], help="residual coder (default ac; lzma = the report's 'ours: hybrid')")
     g.add_argument("--no-residuals", dest="residuals", action="store_const", const=False, help="prediction only, lossy (as model-only)")
+    g.add_argument("--angle-model", choices=["mean", "vonmises", "empirical", "gaussian"],
+                   help="static chi prior: circular mean (default; single von Mises MLE), vonmises (mode of a 3 component von Mises mixture), empirical (histogram mode), gaussian (non circular mean)")
     g = c.add_argument_group("xtc / tng"); g.add_argument("--xtc-precision", type=float, help="xtc: 1/nm grid (default 1000)")
     g.add_argument("--tng-precision", type=int, help="tng: power of ten 1/nm (default 1000)")
     g = c.add_argument_group("mdcompress"); g.add_argument("--mdc-res", type=int, help="resolution in fm (default 1000 = 0.01 A)")
@@ -714,6 +722,12 @@ def main(argv=None):
     g.add_argument("--ct-epochs", type=int); g.add_argument("--ct-layers"); g.add_argument("--ct-batch", type=int)
     g = c.add_argument_group("cg2all"); g.add_argument("--cg-model"); g.add_argument("--cg-precision", type=float); g.add_argument("--cg-device", choices=["cpu", "cuda"])
     g.add_argument("--cg-store", choices=["xtc", "lzma"], help="bead storage: xtc (default, as the report) or quantise + delta + lzma")
+    g = c.add_argument_group("dvorak (PMC, Dvorak et al. 2020)"); g.add_argument("--dv-qr", type=float, help="residual step in A (local frame; max error sqrt(3)/2 of it); default from --bound")
+    g.add_argument("--dv-qa", type=float, help="rotation angle step, rad (default 0.1)"); g.add_argument("--dv-qc", type=float, help="canonical molecule step, A (default 0.001)")
+    g.add_argument("--dv-cutoff", type=float, help="bond = atom pair closer than this in the first frame, A (default 2.1)")
+    g = c.add_argument_group("mdz (SZ3 MDZ, Zhao et al. 2022)"); g.add_argument("--mdz-batch", type=int, help="frames per batch (default 10)")
+    g.add_argument("--mdz-predictor", choices=["adp", "vq", "vqt", "mt", "lr", "ts"], help="adp (default) picks per batch; or force one")
+    g.add_argument("--mdz-quantbins", type=int, help="quantisation bins (default 1024)")
     c.add_argument("--atoms", default="protein", help="protein (atom14 heavy atoms, default), all, or an MDAnalysis selection (non hybrid methods)")
     c.add_argument("--stride", type=int, default=1); c.add_argument("--threads", type=int, default=4)
     d = sp.add_parser("decompress"); d.add_argument("--in", dest="inp", required=True); d.add_argument("--top", required=True); d.add_argument("--out", required=True)

@@ -7,7 +7,7 @@ Run from the repository root (the research modules load results_gpu/runs/e2e_S_p
 Checks: (1) decoder output equals the encoder side reconstruction bit for bit (float32), (2) max |error| <= bound
 (lossless: <= 0.005 A, the 0.01 A grid), (3) a second decode with a different thread count is identical,
 (4) default mode ratios at T=1000 on the 16 mdCATH domains agree with the ablation 'neither' (packer only) results,
-(5) every alternative method (--method xtc, tng, mdcompress, new-coder, lzma, zstd, bz2) roundtrips through the container
+(5) every alternative method (--method xtc, tng, mdcompress, new-coder, lzma, zstd, bz2, ..., dvorak, mdz) roundtrips through the container
 with its error bound respected, exact reconstruction where the method is lossless (float32 'exact' mode of lzma / zstd /
 bz2, plain coordinates via compress_xyz), and the method and options read back from the header.
     python tests/test_codec.py --methods-only   # only (5) and the method comparison table"""
@@ -43,7 +43,8 @@ def roundtrip(d, bound, threads_dec=None, **kw):
     truth = np.concatenate([d["coords"][:, mk]] + ([d["extra"]] if d["extra"] is not None else []), 1)
     b = 0.005 if bound == 0 else bound
     res = dict(bitexact=bool(np.array_equal(out, rec.astype(np.float32))),
-               max_err=float(np.abs(out.astype(np.float64) - truth).max()), bound=b, ratio=info["ratio"], bytes=info["total"],
+               max_err=float(np.abs(out.astype(np.float64) - truth).max()), bound=b,
+               rmsd=float(np.sqrt(((out.astype(np.float64) - truth) ** 2).sum(-1).mean())), ratio=info["ratio"], bytes=info["total"],
                enc_s=round(te, 2), dec_s=round(td, 2), mode=dict(backbone=r["backbone"], full_predictor=r["full_predictor"]),
                header_ok=bool(r["backbone"] == kw.get("backbone", "mean") and r["full_predictor"] == kw.get("full_predictor", False)),
                topology_ok=bool(np.array_equal(r["aatype"], d["aatype"]) and np.array_equal(r["atom_mask"] > 0, mk)))
@@ -70,7 +71,11 @@ METHOD_CASES = [  # (method, bound, options); 'lossless' for xtc / tng means the
     ("pcazip", None, {"pca_components": 10, "pca_entropy": "lzma"}),
     ("pcazip", None, {"pca_variance": 0.95, "pca_residual_scale": 0, "pca_frame": "fitted"}),
     ("compresstraj", None, {}), ("cg2all", None, {}), ("cg2all", None, {"cg_model": "BackboneModel"}), ("cg2all", None, {"cg_precision": 100}),
-    ("cg2all", None, {"cg_store": "lzma"})]
+    ("cg2all", None, {"cg_store": "lzma"}),
+    ("hybrid", 0.1, {"angle_model": "vonmises"}), ("hybrid", 0.0, {"angle_model": "empirical"}), ("hybrid-ae", 0.1, {"angle_model": "gaussian"}),
+    ("dvorak", 0.1, {}), ("dvorak", 0.5, {}), ("dvorak", None, {"dv_qr": 0.05, "dv_qa": 0.05}), ("dvorak", 0.2, {"dv_cutoff": 1.8, "dv_qc": 0.01}),
+    ("mdz", 0.1, {}), ("mdz", 0.5, {}), ("mdz", 0.1, {"mdz_predictor": "mt"}), ("mdz", 0.1, {"mdz_predictor": "ts", "mdz_batch": 50}),
+    ("mdz", 0.2, {"mdz_predictor": "lr", "mdz_quantbins": 4096})]
 LOSSLESS_FORMATS = ("trr", "dcd", "netcdf")  # float32 copies: must be exact
 SLOW_T = {"cg2all": 100}  # cg2all on CPU takes about 3 s per frame (encode measures nothing; the test decodes once)
 
@@ -134,7 +139,21 @@ def test_methods():
         for m, b, o in METHOD_CASES:
             if m in ("cg2all", "compresstraj"): continue  # slow on CPU: covered by --methods-only
             res = method_roundtrip(d, m, b, o); assert res["pass"], (m, b, o, res)
-def test_xyz(): os.chdir(ROOT); d = load("4m70B00", 50); assert all(xyz_roundtrip(d, m, b)["pass_"] for m, b in (("zstd", "exact"), ("lzma", 0.1), ("new-coder", 0.1), ("xtc", 0.1)))
+def test_angle_prior():
+    """Circular chi prior: von Mises mixture mode across the +-pi seam; the linear (gaussian) mean is pulled away by the wrap."""
+    from md_compress.angles import chi_prior
+    rng = np.random.default_rng(0); T = 400
+    a = np.where(rng.random(T) < 0.7, np.pi - 0.05, -2.0) + rng.normal(0, 0.15, T)
+    sc = np.zeros((T, 1, 4, 2)); sc[..., 1] = 1.0; sc[:, 0, 0] = np.stack([np.sin(a), np.cos(a)], -1)
+    mask = np.zeros((1, 4), bool); mask[0, 0] = True; per = np.zeros((1, 4), bool)
+    ang = lambda m: float(np.arctan2(*chi_prior(sc, mask, per, m)[0, 0]))
+    d = lambda x, y: abs((x - y + np.pi) % (2 * np.pi) - np.pi)
+    assert d(ang("vonmises"), np.pi - 0.05) < 0.1 and d(ang("empirical"), np.pi - 0.05) < 0.15
+    assert d(ang("gaussian"), np.pi - 0.05) > 0.5
+    assert np.allclose(chi_prior(sc, mask, per, "vonmises")[0, 1:], [0.0, 1.0])  # unmasked chis keep the neutral prior
+def test_dvorak_short():  # PMC needs >= 50 frames; shorter inputs are padded by the wrapper and cut on decode
+    os.chdir(ROOT); d = load("1e8rA00", 20); r = xyz_roundtrip(d, "dvorak", 0.1); assert r["pass_"], r
+def test_xyz(): os.chdir(ROOT); d = load("4m70B00", 50); assert all(xyz_roundtrip(d, m, b)["pass_"] for m, b in (("zstd", "exact"), ("lzma", 0.1), ("new-coder", 0.1), ("xtc", 0.1), ("dvorak", 0.1), ("mdz", 0.1)))
 
 
 def main():
@@ -155,10 +174,6 @@ def main():
         print(key, "PASS" if res["pass"] else "FAIL", {k: res[k] for k in ("max_err", "ratio", "bitexact", "enc_s", "dec_s")}, flush=True)
     if a.quick: return
     abl = {}
-    missing = [f for f in ("ablation_A.json", "ablation_B.json", "ablation_C.json") if not os.path.exists(f"{ABL}/{f}")]
-    if missing:
-        print("skipping ratio comparison (run the ablation stage first; missing " + ", ".join(missing) + ")", flush=True)
-        return
     for f in ("ablation_A.json", "ablation_B.json", "ablation_C.json"): abl.update(json.load(open(f"{ABL}/{f}")))
     for n in DOMS + ["mddb_small_1APQ"]:
         d = load(n, 1000)
@@ -188,7 +203,7 @@ def run_methods(a):
             out[key] = res; json.dump(out, open(out_p, "w"), indent=1)
             print(key, "PASS" if res["pass"] else "FAIL", f"ratio {res['ratio']:.2f} max_err {res['max_err']:.6f} rmsd {res.get('rmsd', float('nan')):.4f} bound {res['bound']} exact {res.get('exact')}", flush=True)
     d = load("4m70B00", 100)
-    for m, b in (("zstd", "exact"), ("lzma", 0.1), ("bz2", 0.0), ("new-coder", 0.1), ("xtc", 0.1), ("mdcompress", 0.1), ("tng", 0.1)):
+    for m, b in (("zstd", "exact"), ("lzma", 0.1), ("bz2", 0.0), ("new-coder", 0.1), ("xtc", 0.1), ("mdcompress", 0.1), ("tng", 0.1), ("dvorak", 0.1), ("mdz", 0.1)):
         key = f"xyz/4m70B00/T100/{m} @ {b}"
         if key in out: continue
         r = xyz_roundtrip(d, m, b); r["pass"] = r.pop("pass_"); out[key] = r; json.dump(out, open(out_p, "w"), indent=1)

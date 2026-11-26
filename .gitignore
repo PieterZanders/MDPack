@@ -56,9 +56,11 @@ benchmark/benchmark_report.pdf
 benchmark/figs/
 benchmark/entropy/*_section.md
 benchmark/entropy/readme_results_block.md
+report_mdpack/
 
 # Generated result dumps and logs (rebuild with the data, baselines, entropy, scaling, ablation and codec stages)
 benchmark/results/
+benchmark/logs/
 benchmark/entropy/results/
 benchmark/entropy/logs/
 benchmark/entropy/dumps/

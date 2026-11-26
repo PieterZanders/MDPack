@@ -97,8 +97,13 @@ def error_stats(rec, truth, limit=None, groups=None, chunk=100):
                       fraction_within_limit=None if limit is None else a["within"] / n,
                       per_frame_rmsd_lab=dict(mean=float(fr.mean()), min=float(fr.min()), max=float(fr.max())),
                       atoms_missing=a["miss"])
+    summary = {f"rmsd_{n}": (out[k]["per_frame_rmsd_lab"]["mean"] if k in out else None)
+               for n, k in (("all", "all"), ("backbone", "backbone"), ("sidechain", "side_chain"))}
     return dict(bit_exact=bool(exact), percentiles_from_subsample=step > 1, tolerance_angstrom=TOL if limit is not None else None,
-                abs_error_is="per Cartesian component, Angstrom", groups=out)
+                abs_error_is="per Cartesian component, Angstrom",
+                rmsd_is="decoded against original, per frame RMSD in the lab frame (no superposition), mean over frames, Angstrom; "
+                        "backbone = protein N, CA, C, O (plus OXT and any extra atoms coded with the backbone stream), "
+                        "sidechain = the remaining protein heavy atoms", **summary, groups=out)
 
 
 # ---------------------------------------------------------------- resolution
@@ -119,6 +124,11 @@ def resolution(method, opts, bound, residuals=True):
     elif method == "tng": p = {"tng_precision_per_nm": o.get("tng_precision"), "step_angstrom": 10 / o["tng_precision"]} if o.get("tng_precision") else {}
     elif method == "pdb": p = {"decimals": o.get("pdb_precision"), "step_angstrom": 10.0 ** -o["pdb_precision"]} if o.get("pdb_precision") is not None else {}
     elif method == "mdcompress": p = {"resolution_fm": o.get("mdc_res"), "step_angstrom": o["mdc_res"] * 1e-5} if o.get("mdc_res") else {}
+    elif method == "dvorak": p = {"residual_step_angstrom_local_frame": o.get("dv_qr"), "angle_step_rad": o.get("dv_qa"),
+                                  "canonical_step_angstrom": o.get("dv_qc"), "bond_cutoff_angstrom": o.get("dv_cutoff"), "bonds": o.get("n_bonds"),
+                                  "note": "per component error <= sqrt(3)/2 x residual step (residuals are quantised in a rotated local frame)"}
+    elif method == "mdz": p = {"absolute_bound_angstrom": bound, "batch_frames": o.get("mdz_batch"), "predictor": o.get("mdz_predictor"),
+                               "batches_per_predictor": o.get("batches_per_predictor"), "quantbins": o.get("mdz_quantbins")}
     elif method == "h5md" and o.get("h5md_compression") == "sz3": p = {"sz3_absolute_nm": o.get("h5md_sz3_abs")}
     elif method == "cg2all": p = {"beads": o.get("n_beads"), "bead_precision_per_nm": o.get("cg_precision"), "bead_store": o.get("cg_store"),
                                   "note": "all atoms are rebuilt by cg2all; no error limit"}

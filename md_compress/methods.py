@@ -15,6 +15,18 @@ payload in the .mdz container, whose header records the method id and its option
   new-coder   model free quantisation + the context modelled arithmetic coder (gpu/residual_entropy.c), no network.
               nc_predictor = 'mean' (default: mean structure after a per frame rigid fit) or 'raw' (coordinates
               themselves; the coder's temporal context does the prediction). bound in Angstrom or lossless (0.01 A grid).
+  dvorak      PMC, the authors' own tool for Dvorak, Manak and Vasa, J Mol Graph Model 96 (2020) 107531: bonds are
+              traversed from an entrance atom; each atom's newly reached bonded neighbours are predicted from a canonical
+              molecule rotated into the local frame of the bond to its predecessor (a quantised rotation angle about that
+              bond per frame), and the residual is quantised in that local frame and Huffman coded. Wrapped binary:
+              pmc.dll 1.0 run by dotnet. dv_qr = residual step (A, local frame); from a bound b, dv_qr = 2 b / sqrt(3)
+              (the local frame is rotated, so a per component world error <= b needs the local error vector <= b).
+              dv_qa angle step (rad, default 0.1), dv_qc canonical molecule step (A, default 0.001), dv_cutoff:
+              bonds = atom pairs closer than this in the first frame (A, default 2.1; heavy atoms). Bonds are stored.
+  mdz         MDZ (Zhao et al., ICDE 2022) from SZ3 tools/mdz, through md_compress/ext/mdz_file.cpp (the same per
+              batch loop as MDZ_Compress, writing the streams to a file). Absolute bound b per coordinate; mdz_batch
+              frames per batch (default 10, MDZ's default); mdz_predictor adp (default: MDZ picks per batch among
+              VQ / VQT when clustering levels exist, else LR, and MT), vq, vqt, mt, lr, ts; mdz_quantbins (default 1024).
   lzma, zstd, bz2
               generic: quantise to a 2 b grid (bound b) or the 0.01 A grid (lossless) or keep float32 bits (exact),
               time delta (delta='time', default) or none, zigzag, byte planes, then the general purpose compressor
@@ -24,13 +36,14 @@ import bz2, io, json, lzma, os, shutil, struct, subprocess, tempfile
 import numpy as np
 
 METHODS = {"xtc": 1, "tng": 2, "mdcompress": 3, "new-coder": 4, "lzma": 5, "zstd": 6, "bz2": 7, "gzip": 8, "trr": 9, "dcd": 10,
-           "netcdf": 11, "pdb": 12, "h5md": 13, "pcazip": 14, "compresstraj": 15, "cg2all": 16}
+           "netcdf": 11, "pdb": 12, "h5md": 13, "pcazip": 14, "compresstraj": 15, "cg2all": 16,
+           "dvorak": 17, "mdz": 18}
 NAMES = {v: k for k, v in METHODS.items()}
 GRID = 0.01
 
 HELP = {  # name: (description, flags, report section)
     "hybrid": ("ours, default: shared packer side chains + mean structure backbone + context modelled coder (error bounded)",
-               "--bound B|lossless (default 0.1), --backbone mean|ae, --full-predictor, --coder ac|lzma, --no-residuals", "4.6, 4.7.6, 4.7.7"),
+               "--bound B|lossless (default 0.1), --backbone mean|ae, --full-predictor, --coder ac|lzma, --no-residuals, --angle-model mean|vonmises|empirical|gaussian (static chi prior)", "4.6, 4.7.6, 4.7.7"),
     "hybrid-ae": ("ours: hybrid with the backbone autoencoder (= hybrid --backbone ae)", "as hybrid", "4.6.6"),
     "model-only": ("ours: model only (backbone AE latents + rotamer codes + per trajectory MLP, no residuals; lossy, no bound)",
                    "--coder n/a; lossy, ignores --bound", "4.1, 4.2"),
@@ -53,6 +66,12 @@ HELP = {  # name: (description, flags, report section)
                      "--ct-compression C (default 20) or --ct-latent L, --ct-epochs E (default 200), --ct-layers 4096,1024, --ct-batch 128", "4.1b (compresstraj)"),
     "cg2all": ("coarse grained beads stored, all atoms rebuilt by cg2all; lossy, no bound",
                "--cg-model CalphaBasedModel|ResidueBasedModel|BackboneModel|..., --cg-precision P (1/nm, default 1000), --cg-store xtc|lzma, --cg-device cpu|cuda", "4.1 (cg2all)"),
+    "dvorak": ("Dvorak, Manak, Vasa 2020 predictive compression (bond graph, local rotations); the authors' PMC 1.0 tool",
+               "--bound B (default 0.1) or --dv-qr Q (residual step, A; max error sqrt(3)/2 Q), --dv-qa RAD (default 0.1), --dv-qc A (default 0.001), --dv-cutoff A (bond distance in frame 1, default 2.1)",
+               "4.7.7 (Dvorak 2020)"),
+    "mdz": ("MDZ (Zhao et al., ICDE 2022, SZ3 tools/mdz): per batch predictor choice, Huffman + zstd (error bounded)",
+            "--bound B (default 0.1), --mdz-batch N (default 10), --mdz-predictor adp|vq|vqt|mt|lr|ts (default adp), --mdz-quantbins N (default 1024)",
+            "4.7.7 (MDZ)"),
     "lzma": ("quantise + time delta + byte planes + lzma", "--bound B|lossless|exact, --level 0..9 (default 9), --delta time|none", "generic baseline"),
     "zstd": ("quantise + time delta + byte planes + zstandard", "--bound B|lossless|exact, --level 1..22 (default 19), --delta time|none", "generic baseline"),
     "bz2": ("quantise + time delta + byte planes + bzip2", "--bound B|lossless|exact, --level 1..9 (default 9), --delta time|none", "generic baseline"),
@@ -66,6 +85,9 @@ def _which(env, name, *fallback):
     return None
 
 
+def pmc_path(): return _which("MDPACK_PMC", "pmc.dll", "/workspace/bench_tools/pmc/bin/pmc.dll")
+def dotnet_path(): return _which("MDPACK_DOTNET", "dotnet", "/workspace/bench_tools/dotnet/dotnet")
+def mdz_path(): return _which("MDPACK_MDZ", "mdz_file", "/workspace/bench_tools/sz3/bin/mdz_file")
 def gmx_path(): return _which("MD_COMPRESS_GMX", "gmx", "/workspace/conda/envs/gmx/bin/gmx")
 def mdc_path(): return _which("MDCOMPRESS_BIN", "mdcompress", "/workspace/bench_tools/mdcbin/mdcompress")
 
@@ -603,3 +625,135 @@ def dec_cg2all(data, T, N, opts, topo, threads=4):
             if (ri, nmx) in slot: src.append(a.index); dst.append(slot[(ri, nmx)])
     out[:, dst] = t.xyz[:, src] * 10
     return out
+
+
+# ---------------------------------------------------------------- dvorak (PMC, Dvorak, Manak, Vasa 2020)
+def _pmc(args, threads):
+    dn, dll = dotnet_path(), pmc_path()
+    if dn is None or dll is None:
+        raise RuntimeError("dvorak needs the PMC 1.0 tool (pmc.dll, https://github.com/jandvorak-uwb/pmc/releases/download/1.0/pmc.zip) "
+                           "and a dotnet runtime; set MDPACK_PMC and MDPACK_DOTNET (see md_compress/ext/get_pmc.sh)")
+    env = dict(os.environ, DOTNET_ROLL_FORWARD="Major", DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_NOLOGO="1",
+               DOTNET_PROCESSOR_COUNT=str(max(1, int(threads))))
+    env.setdefault("DOTNET_ROOT", os.path.dirname(os.path.realpath(dn)))
+    r = subprocess.run([dn, dll] + args, capture_output=True, text=True, env=env)
+    dst = args[args.index("--dst") + 1]
+    if r.returncode or "Exception" in r.stdout + r.stderr or not os.path.exists(dst): raise RuntimeError("pmc " + " ".join(args[:1]) + " failed\n" + (r.stderr + r.stdout)[-1500:])
+
+
+def _bonds(x0, cutoff):
+    """bond graph from the first frame: pairs closer than cutoff -> int32 [E, 2] (i < j)."""
+    from scipy.spatial import cKDTree
+    p = cKDTree(np.asarray(x0, np.float64)).query_pairs(float(cutoff), output_type="ndarray")
+    return np.asarray(p[np.lexsort((p[:, 1], p[:, 0]))] if len(p) else np.zeros((0, 2)), np.int32)
+
+
+def _bonds_txt(path, E, N):
+    nb = [[] for _ in range(N)]
+    for i, j in E: nb[i].append(int(j)); nb[j].append(int(i))
+    with open(path, "w") as f: f.write("\n".join(" ".join(map(str, n)) for n in nb) + "\n")
+
+
+def _pmc_bin_write(path, x):
+    T = len(x)
+    with open(path, "wb") as f: f.write(np.int32(3 * T).tobytes()); f.write(np.ascontiguousarray(np.transpose(x, (1, 0, 2)), np.float32).tobytes())
+
+
+def _pmc_bin_read(path, T, N): return np.fromfile(path, np.float32, offset=4).reshape(N, T, 3).transpose(1, 0, 2).copy()
+
+
+def _edges_pack(E):  # sorted (i, j): delta of i, j - i, zigzag, lzma
+    if not len(E): return lzma.compress(b"")
+    a = np.stack([np.diff(E[:, 0], prepend=0), E[:, 1] - E[:, 0]], 1).astype(np.int32)
+    return lzma.compress(a.tobytes(), preset=9)
+
+
+def _edges_unpack(b):
+    a = np.frombuffer(lzma.decompress(b), np.int32).reshape(-1, 2)
+    i = np.cumsum(a[:, 0]); return np.stack([i, i + a[:, 1]], 1).astype(np.int32)
+
+
+PMC_MIN_FRAMES = 50
+
+
+def enc_dvorak(x, bound=None, dv_qr=None, dv_qa=None, dv_qc=None, dv_cutoff=None, threads=4, **_):
+    from md_compress import codec as C
+    kind, b = _bound(bound)
+    if kind in ("lossless", "exact"): raise ValueError("dvorak is lossy (residuals on a rotated local grid); use a positive bound or --dv-qr")
+    qr = float(dv_qr) if dv_qr else float(2 * (b or 0.1) / np.sqrt(3) * 0.999)  # 0.1 % margin for float32 rounding in PMC's arithmetic
+    qa = float(dv_qa) if dv_qa else 0.1; qc = float(dv_qc) if dv_qc else 0.001; cut = float(dv_cutoff) if dv_cutoff else 2.1
+    x = np.ascontiguousarray(x, np.float32); T, N = x.shape[:2]
+    E = _bonds(x[0], cut)
+    # Two PMC 1.0 limitations are handled here by padding frames after the real ones; the decoder drops them (it knows T
+    # from the container header and the pad count from the options):
+    #  (1) the canonical molecule is built from every 50th frame, so PMC fails with fewer than 50 frames
+    #      (IterativeCanonicalMoleculeBuilder.GetCanonical: usedFrames = new int[NumFrames / 50]);
+    #  (2) its Huffman decoder fails on a stream that holds a single symbol (HuffmannCoder.DecodePrefill: a one leaf tree
+    #      has no transitions), which happens when an atom's residuals or angles are constant, e.g. few frames at a coarse
+    #      bound. Short inputs are padded with copies of the last frame, then (if PMC's own decode fails) mirrored frames, then the
+    #      last frame plus seeded noise of a few grid steps, so every stream has two or more symbols (costlier). Inputs with
+    #      T >= 50 are first tried without padding; two noise frames are added only if PMC's decode fails.
+    def attempt(npad, mode):
+        xp = x
+        if npad and mode == "edge":  # copies of the last frame: cheapest
+            xp = np.concatenate([x, np.repeat(x[-1:], npad, 0)])
+        elif npad and mode == "mirror":  # frames T-2, T-3, ..., 0, 1, ... : cheap, real motion
+            xp = np.pad(x, ((0, npad), (0, 0), (0, 0)), mode="reflect" if T > 1 else "edge")
+        elif npad:
+            rng = np.random.default_rng(0)
+            xp = np.concatenate([x, x[-1:] + rng.uniform(-3, 3, (npad, N, 3)).astype(np.float32) * np.float32(qr)])
+        with tempfile.TemporaryDirectory() as d:
+            _bonds_txt(f"{d}/b.txt", E, N); _pmc_bin_write(f"{d}/t.bin", xp)
+            _pmc(["encode", "--src", f"{d}/t.bin", "--bonds", f"{d}/b.txt", "--dst", f"{d}/t.pmc", "--qr", str(float(qr)), "--qa", str(float(qa)), "--qc", str(float(qc))], threads)
+            data = open(f"{d}/t.pmc", "rb").read()
+            _pmc(["decode", "--src", f"{d}/t.pmc", "--bonds", f"{d}/b.txt", "--dst", f"{d}/o.bin"], threads)
+            return data, float(np.abs(_pmc_bin_read(f"{d}/o.bin", len(xp), N)[:T].astype(np.float64) - x).max())
+    tries = [(PMC_MIN_FRAMES - T, m) for m in ("edge", "mirror", "noise")] if T < PMC_MIN_FRAMES else [(0, "none"), (2, "noise")]
+    for k, (npad, pad) in enumerate(tries):
+        try: data, err = attempt(npad, pad); break
+        except RuntimeError as ex:
+            if "decode failed" not in str(ex) or k == len(tries) - 1: raise
+    claim = b if (b and not dv_qr) else np.sqrt(3) / 2 * qr
+    if err > claim + 1e-5: raise RuntimeError(f"dvorak: max error {err:.6f} A exceeds the bound {claim:.6f} A")
+    W = C._W(); W.sec(_edges_pack(E)); W.sec(data)
+    return W.b.getvalue(), dict(dv_qr=qr, dv_qa=qa, dv_qc=qc, dv_cutoff=cut, n_bonds=int(len(E)), pmc_padded_frames=int(npad), pmc_pad=pad, encoder_max_error=err), float(claim)
+
+
+def dec_dvorak(data, T, N, opts, threads=4):
+    from md_compress import codec as C
+    rd = C._R(data, 0); E = _edges_unpack(rd.sec()); pm = rd.sec()
+    with tempfile.TemporaryDirectory() as d:
+        _bonds_txt(f"{d}/b.txt", E, N); open(f"{d}/t.pmc", "wb").write(pm)
+        _pmc(["decode", "--src", f"{d}/t.pmc", "--bonds", f"{d}/b.txt", "--dst", f"{d}/o.bin"], threads)
+        return _pmc_bin_read(f"{d}/o.bin", T + int(opts.get("pmc_padded_frames", 0)), N)[:T]
+
+
+# ---------------------------------------------------------------- mdz (SZ3 tools/mdz)
+MDZ_PRED = {"adp": -1, "vq": 0, "vqt": 1, "mt": 2, "lr": 3, "ts": 4}
+
+
+def enc_mdz(x, bound=None, mdz_batch=None, mdz_predictor=None, mdz_quantbins=None, threads=4, **_):
+    m = mdz_path()
+    if m is None: raise RuntimeError("mdz needs the mdz_file wrapper built against SZ3 (md_compress/ext/build_mdz.sh); set MDPACK_MDZ")
+    kind, b = _bound(bound)
+    if kind in ("lossless", "exact"): raise ValueError("mdz is lossy (SZ3 error bounded); use a positive bound")
+    b = b or 0.1; bt = int(mdz_batch or 10); pr = mdz_predictor or "adp"; qb = int(mdz_quantbins or 1024)
+    if pr not in MDZ_PRED: raise ValueError("mdz_predictor must be one of " + ", ".join(MDZ_PRED))
+    x = np.ascontiguousarray(x, np.float32); T, N = x.shape[:2]
+    with tempfile.TemporaryDirectory() as d:
+        x.tofile(f"{d}/a.f32")
+        r = subprocess.run([m, "c", f"{d}/a.f32", f"{d}/a.mdzf", str(T), str(N), repr(float(b)), str(bt), str(MDZ_PRED[pr]), str(qb)], capture_output=True, text=True)
+        if r.returncode: raise RuntimeError("mdz_file compress failed\n" + (r.stderr + r.stdout)[-1500:])
+        used = json.loads(r.stdout.strip().splitlines()[-1]); data = open(f"{d}/a.mdzf", "rb").read()
+        _run([m, "d", f"{d}/a.mdzf", f"{d}/o.f32"])
+        err = float(np.abs(np.fromfile(f"{d}/o.f32", np.float32).reshape(x.shape).astype(np.float64) - x).max())
+    if err > b + 1e-5: raise RuntimeError(f"mdz: max error {err:.6f} A exceeds the bound {b} A")
+    return data, dict(mdz_batch=bt, mdz_predictor=pr, mdz_quantbins=qb, batches_per_predictor=used, encoder_max_error=err), float(b)
+
+
+def dec_mdz(data, T, N, opts, threads=4):
+    m = mdz_path()
+    if m is None: raise RuntimeError("decoding mdz needs the mdz_file wrapper (md_compress/ext/build_mdz.sh); set MDPACK_MDZ")
+    with tempfile.TemporaryDirectory() as d:
+        open(f"{d}/a.mdzf", "wb").write(data); _run([m, "d", f"{d}/a.mdzf", f"{d}/o.f32"])
+        return np.fromfile(f"{d}/o.f32", np.float32).reshape(T, N, 3)

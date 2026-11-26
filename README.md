@@ -25,6 +25,8 @@ External tools, found on `PATH` or through an environment variable:
 * pyPcazip (`mdplus`) for `--method pcazip`.
 * The compresstraj package, or `COMPRESSTRAJ_PATH`, for `--method compresstraj`.
 * A cg2all installation (`MD_COMPRESS_CG2ALL_BIN` should point at its `bin` directory) for `--method cg2all`.
+* PMC 1.0, the authors' tool for Dvořák, Maňák and Váša (J Mol Graph Model 2020), and a .NET runtime (8 or later), for `--method dvorak`. `bash md_compress/ext/get_pmc.sh PREFIX` downloads PMC (checksum verified) and a .NET 8 runtime; then set `MDPACK_PMC=PREFIX/pmc/bin/pmc.dll` and `MDPACK_DOTNET=PREFIX/dotnet/dotnet`.
+* `mdz_file`, a file front end for MDZ (Zhao et al., ICDE 2022) built against SZ3, for `--method mdz`. `bash md_compress/ext/build_mdz.sh PREFIX` clones SZ3 at a pinned commit and builds it (needs git, cmake 3.19 or later, a C++17 compiler and libzstd); then set `MDPACK_MDZ=PREFIX/bin/mdz_file`. `./reproduce.sh --stage tools` runs both scripts.
 
 The residual entropy coder is the C source `gpu/residual_entropy.c`. On first import, `gpu/residual_entropy.py` builds `gpu/_residual_entropy.so` with `gcc` if the library is missing or older than the source. You need `gcc` on `PATH`. The `.so` is not committed; you can also build it by importing the module:
 
@@ -75,6 +77,7 @@ blob, info = compress(..., return_info=True)  # info: size breakdown and options
 | `bound` | a float in Angstrom, or `0` / `"lossless"` | maximum absolute error per coordinate. Lossless is exact on the 0.01 Angstrom grid (maximum error 0.005 Angstrom). |
 | `backbone` | `"mean"` (default), `"ae"` | `"ae"` uses the shared backbone autoencoder (fp16 latents, lzma) instead of the mean structure. |
 | `full_predictor` | `False` (default), `True` | per frame rotamer state codes and a per trajectory fine tuned MLP. |
+| `angle_model` | `"mean"` (default), `"vonmises"`, `"empirical"`, `"gaussian"` | how the static per residue side chain torsion prior is estimated: circular mean (single von Mises maximum likelihood mean), mode of a 3 component von Mises mixture, histogram mode, or arithmetic mean (non circular). The prior is stored in the file, so decoding does not depend on it. CLI: `--angle-model`. |
 
 Common flags for every method: `--stride`, `--threads`, `--bound`, and `--atoms protein` (default: atom14 protein heavy atoms plus OXT, required for the `hybrid` family and `cg2all`), `--atoms all`, or an MDAnalysis selection string. The selection is stored and reused on decompression.
 
@@ -86,9 +89,9 @@ The decoder recomputes packer (and autoencoder) predictions on a fixed single to
 
 | method | what it stores | flags | error kind |
 |---|---|---|---|
-| `hybrid` (default) | mean structure backbone, shared packer side chains, residuals, context modelled coder | `--bound B\|lossless` (default 0.1), `--backbone mean\|ae`, `--full-predictor`, `--coder ac\|lzma`, `--no-residuals` | bounded (max B Angstrom); lossless uses the 0.01 Angstrom grid |
+| `hybrid` (default) | mean structure backbone, shared packer side chains, residuals, context modelled coder | `--bound B\|lossless` (default 0.1), `--backbone mean\|ae`, `--full-predictor`, `--coder ac\|lzma`, `--no-residuals`, `--angle-model mean\|vonmises\|empirical\|gaussian` | bounded (max B Angstrom); lossless uses the 0.01 Angstrom grid |
 | `hybrid-ae` | as `hybrid`, with the backbone from the shared backbone autoencoder | same as `hybrid` | bounded or lossless, as `hybrid` |
-| `model-only` | autoencoder latents, rotamer codes, per trajectory MLP, no residuals | none | no limit (RMSD and maximum error are reported) |
+| `model-only` | autoencoder latents, rotamer codes, per trajectory MLP, no residuals | `--angle-model` | no limit (RMSD and maximum error are reported) |
 | `new-coder` | raw coordinates or mean structure residuals, no AI model | `--bound B\|lossless`, `--nc-predictor mean\|raw`, `--nc-coder ac\|lzma` | bounded or lossless |
 | `xtc` | GROMACS XTC | `--xtc-precision P` (1/nm, default 1000) or `--bound B` (P = 5/B) | bounded (max 5/P Angstrom) |
 | `tng` | GROMACS TNG, via `gmx trjconv` | `--tng-precision P` (power of ten, default 1000) or `--bound B` | bounded (max 5/P Angstrom) |
@@ -101,9 +104,11 @@ The decoder recomputes packer (and autoencoder) predictions on a fixed single to
 | `pcazip` | pyPcazip 3 file, plus an optional per frame fit | `--pca-variance EV` (default 0.75) or `--pca-components N`, `--pca-residual-scale S` (per nm, default 200; 0 means PCA only), `--pca-eigenvector-scale`, `--pca-entropy lzma`, `--pca-frame lab\|fitted` | no limit (RMSD and maximum error are reported) |
 | `compresstraj` | compresstraj autoencoder (decoder weights, latents, centres, scaler) | `--ct-compression C` (default 20) or `--ct-latent L`, `--ct-epochs E` (default 200), `--ct-layers 4096,1024`, `--ct-batch 128` | no limit (RMSD and maximum error are reported) |
 | `cg2all` | coarse grained beads; all atoms rebuilt by cg2all | `--cg-model CalphaBasedModel\|BackboneModel\|ResidueBasedModel\|...`, `--cg-precision P` (1/nm, default 1000), `--cg-store xtc\|lzma`, `--cg-device cpu\|cuda` | no limit (RMSD and maximum error are reported) |
+| `dvorak` | Dvořák, Maňák, Váša 2020, run by the authors' PMC 1.0: atoms visited along the bond graph, each predicted from a canonical molecule rotated about the bond to its predecessor (one quantised angle per atom and frame), residuals quantised in that local frame, Huffman coded; the bond list (pairs closer than the cutoff in frame 1) is stored | `--bound B` (default 0.1) or `--dv-qr Q` (residual step, Angstrom), `--dv-qa RAD` (angle step, default 0.1), `--dv-qc Q` (canonical molecule step, default 0.001), `--dv-cutoff A` (bond cutoff, default 2.1) | bounded (max B; with `--dv-qr Q`, max √3/2 × Q) |
+| `mdz` | MDZ from SZ3 (`tools/mdz`), through `md_compress/ext/mdz_file.cpp`: per batch choice among VQ, VQT, MT, LR and TS predictors, then Huffman and zstd | `--bound B` (default 0.1), `--mdz-batch N` (frames per batch, default 10), `--mdz-predictor adp\|vq\|vqt\|mt\|lr\|ts` (default adp, adaptive), `--mdz-quantbins N` (default 1024) | bounded (max B) |
 | `lzma`, `zstd`, `bz2`, `gzip` | quantised coordinates, time delta, zigzag, byte planes, then the general purpose compressor | `--bound B\|lossless\|exact`, `--level`, `--delta time\|none` | bounded, lossless, or exact (float32 bits) |
 
-`model-only`, `pcazip`, `compresstraj` and `cg2all` ignore `--bound`. `xtc` and `tng` have no lossless or exact mode. `exact` is available for `lzma`, `zstd`, `bz2` and `gzip`. `trr`, `dcd`, `netcdf` and `h5md` without SZ3 store an exact copy of the float32 input. Default `--pca-frame lab` also stores the per frame rigid transform back to the input frame; `--pca-frame fitted` stores only pcazip's fitted frame. For `compresstraj`, the decoder weights are stored in the file because decompression needs them. Atoms that cg2all does not output (for example OXT) come back as NaN.
+`model-only`, `pcazip`, `compresstraj` and `cg2all` ignore `--bound`. `dvorak` and `mdz` decode their own output before writing and refuse to write a file whose maximum error exceeds the bound; neither has a lossless mode. `xtc` and `tng` have no lossless or exact mode. `exact` is available for `lzma`, `zstd`, `bz2` and `gzip`. `trr`, `dcd`, `netcdf` and `h5md` without SZ3 store an exact copy of the float32 input. Default `--pca-frame lab` also stores the per frame rigid transform back to the input frame; `--pca-frame fitted` stores only pcazip's fitted frame. For `compresstraj`, the decoder weights are stored in the file because decompression needs them. Atoms that cg2all does not output (for example OXT) come back as NaN.
 
 ```bash
 python -m md_compress.codec list-methods
@@ -117,6 +122,9 @@ python -m md_compress.codec compress --top sys.pdb --traj traj.xtc --out t.mdz -
 python -m md_compress.codec compress --top sys.pdb --traj traj.xtc --out t.mdz --method compresstraj --ct-compression 20 --ct-epochs 200
 python -m md_compress.codec compress --top sys.pdb --traj traj.xtc --out t.mdz --method cg2all --cg-model CalphaBasedModel --cg-precision 1000
 python -m md_compress.codec compress --top sys.pdb --traj traj.xtc --out t.mdz --method zstd --bound exact --level 22 --atoms all
+python -m md_compress.codec compress --top sys.pdb --traj traj.xtc --out t.mdz --method dvorak --bound 0.1 --dv-cutoff 2.1
+python -m md_compress.codec compress --top sys.pdb --traj traj.xtc --out t.mdz --method mdz --bound 0.1 --mdz-batch 10 --mdz-predictor adp
+python -m md_compress.codec compress --top sys.pdb --traj traj.xtc --out t.mdz --bound 0.1 --angle-model vonmises
 python -m md_compress.codec decompress --in t.mdz --top sys.pdb --out recon.dcd
 ```
 
@@ -155,7 +163,7 @@ Fields in the JSON:
 * Size: `size` with a per section `breakdown`, `core_bytes`, `metadata_bytes`, `total_bytes`, `ratio` and `ratio_without_metadata` (against float32). `ratio` includes the metadata.
 * Timing: `compress_seconds`, and after decompress also `decompress_seconds`, `write_seconds`, `verify_decode_seconds`.
 * Resolution: `resolution.kind` is `bounded`, `lossless`, `exact` or `no_limit`, plus `error_limit_angstrom`, `stored_precision` and `respects_bound`.
-* Errors: for groups `all`, `backbone`, `side_chain` and `ca`: `rmsd_lab`, `rmsd_superposed_mean`, `abs_error` (mean, median, p99, max), `max_displacement`, `fraction_within_limit`, `per_frame_rmsd_lab` (mean, min, max) and `atoms_missing`. Absolute error is per Cartesian component. Also `bit_exact` and `measured_on`.
+* Errors: for groups `all`, `backbone`, `side_chain` and `ca`: `rmsd_lab`, `rmsd_superposed_mean`, `abs_error` (mean, median, p99, max), `max_displacement`, `fraction_within_limit`, `per_frame_rmsd_lab` (mean, min, max) and `atoms_missing`. Absolute error is per Cartesian component. Also `bit_exact` and `measured_on`. Headline fields: `errors.rmsd_all`, `errors.rmsd_backbone` and `errors.rmsd_sidechain`, the per frame lab frame RMSD (no superposition) averaged over frames, in Angstrom; backbone = N, CA, C, O (plus OXT and any extra atoms coded with the backbone stream), side chain = the other protein heavy atoms (`errors.rmsd_is` states this in the file).
 * Output: `output` (path, format, `extra_rounding_max_angstrom`). With `--ref`, `errors_vs_ref` holds `decoded` and `written_file` groups.
 
 The following is a schema. Every value is a placeholder, not a measured result.
@@ -257,6 +265,7 @@ pytest tests/test_codec.py tests/test_report.py
 ./reproduce.sh --stage report
 ./reproduce.sh --stage entropy --dry-run
 ./reproduce.sh --stage data,baselines
+./reproduce.sh --stage tools,mdpack
 ./reproduce.sh --all
 ```
 
@@ -270,8 +279,10 @@ Stages, in the order used by `--all`:
 | `entropy` | no | the shared checkpoint in `results_gpu/runs/e2e_S_prior` and a built `gpu/_residual_entropy.so` |
 | `scaling` | no | outputs of the `data` stage |
 | `ablation` | no | the shared checkpoint and the built coder |
-| `codec` | no | GROMACS, MDCompress, cg2all, pyPcazip and hdf5plugin, for the method tests |
+| `tools` | no | git, cmake, a C++17 compiler, libzstd and internet; builds `mdz_file` and fetches PMC 1.0 and a .NET runtime (`MDPACK_TOOLS`, default `~/.local/mdpack`) |
+| `codec` | no | GROMACS, MDCompress, cg2all, pyPcazip, hdf5plugin and the `tools` stage, for the method tests |
 | `report` | no | the result JSON produced by earlier stages (not tracked). It writes the Markdown, HTML and PDF report locally; those outputs are not tracked, and this stage does not change the README. |
+| `mdpack` | no | the `tools` stage and the mdCATH domain 4m70B00 from the `data` stage (`MDPACK_MDCATH_LONG` for the atom14 conversion, `MDPACK_BENCH_DATA` for the PDB and reference frames). Runs every method on that one protein (`benchmark/scripts/bench_medium.py --system 4m70B00`) and builds the concise report `report_mdpack/MDPack_report.pdf` (`make_mdpack_report.py`; narrative text from `report_mdpack/report_text.json` if present). Outputs are not tracked. |
 
 The script uses `BENCH_PY` (default: a conda env named `bench`) for the benchmark Python, and `SYS_PY` (default: `python3`) for the report build. Point those variables at interpreters that have the packages you need. Benchmark scripts skip rows already present in their output JSON; delete a result file to recompute it. Lines marked `[HAND]` in the script were done by hand in the original run; lines marked `[INFERRED]` were reconstructed from notes and logs.
 
@@ -279,7 +290,7 @@ The script uses `BENCH_PY` (default: a conda env named `bench`) for the benchmar
 
 | path | contents |
 |---|---|
-| `md_compress/` | Python package: `codec.py` (CLI and API), `methods.py` (the `--method` backends), `report.py` (JSON report), models, geometry and I/O |
+| `md_compress/` | Python package: `codec.py` (CLI and API), `methods.py` (the `--method` backends), `report.py` (JSON report), `angles.py` (circular statistics for `--angle-model`), `ext/` (setup scripts and the MDZ file front end for `dvorak` and `mdz`), models, geometry and I/O |
 | `gpu/` | Residual entropy coder (`residual_entropy.c`, `residual_entropy.py`), training and evaluation scripts, `pipeline.sh` |
 | `tests/` | Codec and report tests, plus fixtures for older `.mdz` files |
 | `tools/` | Helper scripts (figures, summaries, data fetch) |

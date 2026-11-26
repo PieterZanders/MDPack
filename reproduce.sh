@@ -4,7 +4,8 @@
 #
 #   ./reproduce.sh --stage report            # rebuild the report from result JSON produced by earlier stages (no GPU)
 #   ./reproduce.sh --stage data,baselines    # comma separated stages, run in the order given
-#   ./reproduce.sh --all                     # every stage in order: data train baselines entropy scaling ablation codec report
+#   ./reproduce.sh --all                     # every stage in order: data train baselines entropy scaling ablation tools codec report mdpack
+#   ./reproduce.sh --stage tools,mdpack      # tools for --method dvorak / mdz, then the concise report (report_mdpack/MDPack_report.pdf) on one medium protein
 #   ./reproduce.sh --stage entropy --dry-run # print the commands only
 #   ./reproduce.sh --list                    # stages with GPU need and the environments they expect
 #
@@ -26,7 +27,7 @@ MDDB6=mddb_small_1APQ,mddb_dna_1d89,mddb_rna_2l8f,mddb_protdna_FOXA3,mddb_medium
 MDDB7=$MDDB6,mddb_membrane_Eprot
 LZ3=none-nat-vint-lzma,none-nat-planes-lzma,dt-nat-planes-lzma; LZ2=none-nat-vint-lzma,none-nat-planes-lzma
 LEV=10,50,100,250,500,1000,2500,5000,10000
-ALL="data train baselines entropy scaling ablation codec report"
+ALL="data train baselines entropy scaling ablation tools codec report mdpack"
 DRY=0; STAGES=""
 
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -38,8 +39,10 @@ baselines  part  GROMACS, MDCompress and pyPcazip locally; compresstraj and cg2a
 entropy    no    results_gpu/runs/e2e_S_prior and a built gpu/_residual_entropy.so
 scaling    no    outputs of the data stage
 ablation   no    the shared checkpoint and the built coder
-codec      no    GROMACS, MDCompress, cg2all, pyPcazip, hdf5plugin
+tools      no    git, cmake, g++, libzstd-dev, internet (SZ3 / MDZ build, PMC 1.0 and a .NET 8 runtime)
+codec      no    GROMACS, MDCompress, cg2all, pyPcazip, hdf5plugin, the tools stage
 report     no    result JSON from earlier stages (not tracked); writes the report locally (not tracked); does not change the README
+mdpack     no    the tools stage, mdCATH domain 4m70B00 from the data stage; writes result JSON and the PDF locally (not tracked)
 L
 }
 
@@ -169,6 +172,16 @@ stage_ablation() {
   run "$P ablate.py --threads 3 --systems $D8B --T 250 --out $ER/ablation_B250.json > logs/abl_B250.log 2>&1"   # [INFERRED] from the log and result names
 }
 
+# ------------------------------------------------------------------------------------------------- tools (dvorak, mdz)
+TOOLS="${MDPACK_TOOLS:-$HOME/.local/mdpack}"
+stage_tools() {
+  stamp tools
+  cd "$ROOT"
+  run "bash md_compress/ext/build_mdz.sh $TOOLS/sz3"            # -> $TOOLS/sz3/bin/mdz_file (SZ3 commit 28387bee) and the original bin/mdz
+  run "bash md_compress/ext/get_pmc.sh $TOOLS"                  # -> $TOOLS/pmc/bin/pmc.dll (PMC 1.0, sha256 checked) and $TOOLS/dotnet (runtime 8)
+  note "then: export MDPACK_MDZ=$TOOLS/sz3/bin/mdz_file MDPACK_PMC=$TOOLS/pmc/bin/pmc.dll MDPACK_DOTNET=$TOOLS/dotnet/dotnet"
+}
+
 # ------------------------------------------------------------------------------------------------- codec (section 4.7.7)
 stage_codec() {
   stamp codec
@@ -190,6 +203,16 @@ stage_report() {
   run "cd $ENT && $SYS codec_section.py"                       # -> codec_section.md (4.7.7); does not change the README
   run "cd $BEN/scripts && $SYS make_report.py"                 # -> benchmark/benchmark_report.{md,html,pdf}
   run "cd $ENT && $SYS readme_section.py"                      # -> readme_results_block.md (untracked); does not change the README
+}
+
+# ------------------------------------------------------------------------------------------------- mdpack (concise current code report)
+stage_mdpack() {
+  stamp mdpack
+  cd "$BEN"; mkdir -p logs results
+  for st in main angle frames tune slow; do                    # rows -> results/medium_4m70B00_raw.json (resumable; --system picks the protein)
+    run "$P scripts/bench_medium.py --system 4m70B00 --stage $st > logs/medium_4m70B00_$st.log 2>&1"
+  done
+  run "$SYS scripts/make_mdpack_report.py 4m70B00"                     # -> report_mdpack/MDPack_report.{md,html,pdf}; narrative from report_mdpack/report_text.json if present
 }
 
 for s in $STAGES; do "stage_$s"; done

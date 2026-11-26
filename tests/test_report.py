@@ -12,6 +12,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+MDCATH_NPZ = "/workspace/md_compress_gpu_data/data_long/1e8rA00.npz"
 TOP = "/workspace/bench_data/1e8rA00.pdb"; XYZ = "/workspace/bench_data/1e8rA00_T1000.npy"
 FIX = os.path.join(ROOT, "tests/fixtures")
 OUT = os.path.join(ROOT, "benchmark/entropy/results/report_tests.json")
@@ -37,7 +38,9 @@ CASES = [("hybrid", 0.1, {}, "protein", "bounded", 40, ".dcd", 1),
          ("h5md", None, {"h5md_compression": "gzip"}, "name CA", "exact", 40, ".dcd", 1),
          ("pcazip", None, {}, "protein", "no_limit", 40, ".dcd", 1),
          ("compresstraj", None, {"ct_epochs": 5}, "protein", "no_limit", 40, ".dcd", 1),
-         ("cg2all", None, {}, "protein", "no_limit", 5, ".dcd", 1)]
+         ("cg2all", None, {}, "protein", "no_limit", 5, ".dcd", 1),
+         ("dvorak", 0.1, {}, "protein", "bounded", 40, ".dcd", 1),
+         ("mdz", 0.1, {"mdz_predictor": "adp"}, "all", "bounded", 40, ".dcd", 1)]
 SLOW = ("compresstraj", "cg2all")
 
 
@@ -83,7 +86,10 @@ def report_case(method, bound, opts, atoms, kind, T, ext, stride, tmp):
     if kind == "exact": res["exact_ok"] = bool((J.get("errors") or {}).get("bit_exact"))
     if kind in ("bounded", "lossless"):
         res["within_ok"] = g.get("all", {}).get("fraction_within_limit") == 1.0
-    res["pass"] = bool(exists and not missing and not stat_missing and res["stats_match_ref"] and res["sizes_ok"] and res["kind_ok"]
+    E = J.get("errors") or {}
+    res["rmsd_fields_ok"] = all(E.get(f"rmsd_{n}") is not None and np.isclose(E[f"rmsd_{n}"], g[k]["per_frame_rmsd_lab"]["mean"])
+                                for n, k in (("all", "all"), ("backbone", "backbone"), ("sidechain", "side_chain")) if k in g) and "rmsd_all" in E
+    res["pass"] = bool(res["rmsd_fields_ok"] and exists and not missing and not stat_missing and res["stats_match_ref"] and res["sizes_ok"] and res["kind_ok"]
                        and res["api_same"] and res["frames_ok"] and res.get("exact_ok", True) and res.get("within_ok", True))
     for f in os.listdir(tmp):
         if not f.startswith("in_"): os.remove(os.path.join(tmp, f))
@@ -145,6 +151,19 @@ def run(cases):
     for m, v in legacy_cases().items():
         R[f"legacy {m}"] = v; v["pass"] = v.pop("pass_"); print(f"legacy {m}", "PASS" if v["pass"] else "FAIL", v, flush=True)
     return R
+
+
+def test_rmsd_fields():
+    """errors.rmsd_backbone / rmsd_sidechain equal the per frame RMSD computed here from the decoded output (mean over frames)."""
+    from md_compress.codec import compress, decompress
+    os.chdir(ROOT); z = np.load(MDCATH_NPZ); sl = np.where(z["heldout"] == 0)[0][:40]; X = z["coords"][sl]; mk = z["atom_mask"] > 0
+    for method, b in (("hybrid", 0.5), ("lzma", 0.2), ("model-only", None)):
+        blob, info = compress(X, z["aatype"], z["atom_mask"], z["chain_index"], z["chain_break"], bound=b, method=method, return_info=True)
+        r = decompress(blob); E = r["report"]["errors"]; d2 = ((r["coords"].astype(np.float64) - X) ** 2).sum(-1)  # [T, R, 14]
+        slot = np.broadcast_to(np.arange(14), mk.shape)
+        for name, sel in (("backbone", mk & (slot < 4)), ("sidechain", mk & (slot >= 4)), ("all", mk)):
+            want = float(np.sqrt(d2[:, sel].mean(-1)).mean())
+            assert np.isclose(E[f"rmsd_{name}"], want, rtol=1e-4, atol=1e-6), (method, name, E[f"rmsd_{name}"], want)
 
 
 def test_report_fast():
