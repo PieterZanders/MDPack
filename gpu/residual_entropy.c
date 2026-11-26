@@ -15,6 +15,17 @@
  * single adaptive models. Contexts are built only from already coded data: atom class g, axis, and the magnitudes and
  * signs of the coding errors of the same atom in the two previous frames, of the reference atom in this and the
  * previous frame, and of the previous axis of the same atom.
+ * Bond sphere mode (smode 1, blob version 5; smode 2 adds the circle): for an atom with a stored bonded neighbour B that
+ * is earlier in stream order (current frame) and t > 0, the axes are coded in the slot order (k+1)%3, (k+2)%3, k with
+ * k = argmax |P - B| (P: the prediction above). The last slot is predicted from the sphere |x - B| = rb[i] (stored mean
+ * bond length) through the two decoded coordinates, sign from P - B; with smode 2 the middle slot is predicted from the
+ * circle |x - B| = rb[i], cos angle(x - B, C - B) = ct[i] (C: B's stored neighbour, this frame if earlier in stream
+ * order, else the previous frame) through the decoded first coordinate, root nearest to P. Without a real solution
+ * (negative square root argument, degenerate or collinear geometry, NaN) the prediction above is used. Labelled slots
+ * use their own model tables, with the bucketed amplification (rb / |d_k| on the sphere, 1 / |sin| on the circle,
+ * 0 = fallback) selecting the mixer weights and as an extra mixer input and mantissa context. Error contexts of other
+ * atoms and frames are taken on the same lab axis. Only + - * / and sqrt are used (IEEE 754 exact).
+ * smode 0 is bit identical to version 4.
  * Range coder: LZMA style binary range coder with carry propagation, 16 bit probabilities.
  * Everything is integer arithmetic, so encoder and decoder are bit exact on any platform. */
 #include <stdint.h>
@@ -101,6 +112,10 @@ typedef struct {
     bm_t mtop[NBIT][NB], mbit[NBIT][NBIT];
 } model_t;
 
+/* extra tables of the labelled (sphere / circle predicted) slots: amplification bucket ab in 0..NAB-1 */
+#define NAB 9
+typedef struct { mixw_t zw[NG][NAB]; bm_t z7[NAB][NB]; mixw_t uw[NU][NAB]; bm_t u7[NU][NAB][NB]; bm_t mt[NBIT][NAB][NB]; } lab_t;
+
 static void model_init(model_t *m) {
     memset(m, 0, sizeof(*m));
     bm_t *b = (bm_t *)m;   /* the bm_t blocks come first, then mixers/apms are re-initialised below */
@@ -114,6 +129,7 @@ static void model_init(model_t *m) {
     INITW(m->zw, 6); INITW(m->uw, 6); INITW(m->sw, 3);
     INITA(m->za); INITA(m->ua); INITA(m->sa);
 }
+static void lab_init(lab_t *l) { memset(l, 0, sizeof(*l)); INITBM(l->z7); INITBM(l->u7); INITBM(l->mt); INITW(l->zw, 6); INITW(l->uw, 6); }
 
 /* ---------------- range coder (bit = 1 has probability p12/4096) */
 typedef struct { uint64_t low; uint32_t range; uint8_t cache; uint64_t csize; uint8_t *out; int64_t pos, cap; int err; } enc_t;
@@ -170,7 +186,12 @@ static inline int64_t floordiv16(int64_t s) { return (s >= 0) ? (s >> 4) : -((-s
 static inline int sgn3(int32_t v) { return v > 0 ? 2 : (v < 0 ? 1 : 0); }
 static inline uint32_t uabs(int32_t v) { return v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v; }
 
-typedef struct { const double *base; double s; const double *Xc; int Nc; const int32_t *R3; } geo_t;
+typedef struct { const double *base; double s; const double *Xc; int Nc; const int32_t *R3;
+                 int smode; const int32_t *plan; const double *rb; const double *ct; } geo_t;
+static const double AMPT[NAB - 2] = {1.05, 1.2, 1.5, 2.0, 3.0, 5.0, 10.0};
+static inline int abucket(double a) { int k = 0; while (k < NAB - 2 && a >= AMPT[k]) k++; return k + 1; }
+/* x in units of s relative to base -> integer prediction, or 0 (keep the fallback) when not finite or out of range */
+static inline int to_pred(double v, int64_t *out) { if (!(v > -1e9 && v < 1e9)) return 0; *out = (int64_t)__builtin_floor(v + 0.5); return 1; }
 
 static inline int frame3(const double *a, const double *b, const double *c, double F[9]) {
     double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}; double n1 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
@@ -187,15 +208,19 @@ static int run(coder_t *c, int32_t *Q, int T, int N, const int32_t *ref, const u
     double *REC = (double *)malloc(sizeof(double) * (size_t)N * 3 * 2);  /* reconstructed coordinates, frames t-1 and t */
     double fC3[3];
     init_tables();
-    model_t *m = (model_t *)malloc(sizeof(model_t)); if (!m) return -2; model_init(m);
+    model_t *MM[3] = {NULL, NULL, NULL}; lab_t *LB[3] = {NULL, NULL, NULL}; int nm = G->smode ? 3 : 1;
+    for (int k = 0; k < nm; k++) {
+        MM[k] = (model_t *)malloc(sizeof(model_t)); LB[k] = (lab_t *)malloc(sizeof(lab_t));
+        if (!MM[k] || !LB[k]) { for (int j = 0; j <= k; j++) { free(MM[j]); free(LB[j]); } free(REC); return -2; }
+        model_init(MM[k]); lab_init(LB[k]);
+    }
+    int64_t predA[3] = {0, 0, 0}; int perm[3] = {0, 1, 2}, sp = 0; double spP[3] = {0, 0, 0}; const double *sXB = NULL, *sXC = NULL;
     int32_t *EB[3]; for (int k = 0; k < 3; k++) EB[k] = (int32_t *)calloc((size_t)N * 3, 4);
     for (int t = 0; t < T; t++) {
         int32_t *Qc = Q + (int64_t)t * N * 3; const int32_t *Qp = t ? Q + (int64_t)(t - 1) * N * 3 : NULL;
         int32_t *Ec = EB[t % 3]; const int32_t *Ep = t ? EB[(t + 2) % 3] : NULL; const int32_t *Epp = t > 1 ? EB[(t + 1) % 3] : NULL;
         for (int i = 0; i < N; i++) for (int ax = 0; ax < 3; ax++) {
             int g = cls[i] & (NG - 1); int r = ref[i];
-            int32_t qr = (r >= 0) ? Qc[3 * r + ax] : 0; int32_t qp = Qp ? Qp[3 * i + ax] : 0;
-            int32_t qpr = (Qp && r >= 0) ? Qp[3 * r + ax] : 0;
             const int16_t *cf = coef + 4 * g;
             if (ax == 0) {   /* geometric prediction for the whole atom, once per atom and frame */
                 fC3[0] = fC3[1] = fC3[2] = 0.0;
@@ -219,34 +244,93 @@ static int run(coder_t *c, int32_t *Q, int T, int N, const int32_t *ref, const u
                     }
                 }
             }
-            double acc = (double)cf[0] * fC3[ax] + (double)cf[1] * (double)qr + (double)cf[2] * (double)qp + (double)cf[3] * (double)qpr;
-            double pr = __builtin_floor(acc / 64.0 + 0.5);
-            if (pr > 1e9) pr = 1e9; if (pr < -1e9) pr = -1e9;
-            int64_t pred = (int64_t)pr;
+            if (ax == 0) {   /* base prediction of all three axes (same expression as version 4), then the slot order */
+                for (int k = 0; k < 3; k++) {
+                    int32_t qrk = (r >= 0) ? Qc[3 * r + k] : 0, qpk = Qp ? Qp[3 * i + k] : 0, qprk = (Qp && r >= 0) ? Qp[3 * r + k] : 0;
+                    double acc = (double)cf[0] * fC3[k] + (double)cf[1] * (double)qrk + (double)cf[2] * (double)qpk + (double)cf[3] * (double)qprk;
+                    double pr = __builtin_floor(acc / 64.0 + 0.5);
+                    if (pr > 1e9) pr = 1e9; if (pr < -1e9) pr = -1e9;
+                    predA[k] = (int64_t)pr;
+                }
+                perm[0] = 0; perm[1] = 1; perm[2] = 2; sp = 0;
+                if (G->smode && t > 0) {
+                    int B = G->plan[3 * i], Cc = G->plan[3 * i + 1], cur = G->plan[3 * i + 2];
+                    if (B >= 0 && B < i && Cc >= 0 && Cc < N && (cur == 0 || Cc < i) && G->rb[i] > 0) {
+                        double *Rc = REC + (size_t)(t & 1) * N * 3, *Rp = REC + (size_t)((t + 1) & 1) * N * 3;
+                        sXB = Rc + (size_t)B * 3; sXC = cur ? Rc + (size_t)Cc * 3 : Rp + (size_t)Cc * 3;
+                        const double *bi = G->base + ((size_t)t * N + i) * 3; double best = -1.0; int kk = 0;
+                        for (int k = 0; k < 3; k++) { spP[k] = bi[k] + G->s * (double)predA[k]; double d_ = __builtin_fabs(spP[k] - sXB[k]); if (d_ > best) { best = d_; kk = k; } }
+                        perm[0] = (kk + 1) % 3; perm[1] = (kk + 2) % 3; perm[2] = kk; sp = 1;
+                    }
+                }
+            }
+            const int la = perm[ax];
+            int32_t qr = (r >= 0) ? Qc[3 * r + la] : 0; int32_t qp = Qp ? Qp[3 * i + la] : 0;
+            int32_t qpr = (Qp && r >= 0) ? Qp[3 * r + la] : 0;
+            int64_t pred = predA[la];
+            int lbl = 0, ab = 0;
+            if (sp && ax == 2) {   /* sphere */
+                lbl = 1; const double *xi = REC + (size_t)(t & 1) * N * 3 + (size_t)i * 3; double rb = G->rb[i];
+                double d1 = xi[perm[0]] - sXB[perm[0]], d2 = xi[perm[1]] - sXB[perm[1]], arg = rb * rb - d1 * d1 - d2 * d2;
+                if (arg > 0) {
+                    double dk = __builtin_sqrt(arg), sg_ = (spP[la] - sXB[la] >= 0) ? 1.0 : -1.0;
+                    if (to_pred((sXB[la] + sg_ * dk - G->base[((size_t)t * N + i) * 3 + la]) / G->s, &pred)) ab = abucket(rb / dk);
+                }
+            } else if (sp && ax == 1 && G->smode == 2) {   /* circle */
+                lbl = 2; const double *xi = REC + (size_t)(t & 1) * N * 3 + (size_t)i * 3; double rb = G->rb[i], ct = G->ct[i];
+                double u[3] = {sXC[0] - sXB[0], sXC[1] - sXB[1], sXC[2] - sXB[2]}, nu = __builtin_sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+                double st_ = 1.0 - ct * ct;
+                if (nu > 1e-9 && st_ > 0 && ct >= -1.0 && ct <= 1.0) {
+                    u[0] /= nu; u[1] /= nu; u[2] /= nu; double rho = rb * __builtin_sqrt(st_);
+                    double a_[3] = {0, 0, 0}; if (__builtin_fabs(u[0]) < 0.9) a_[0] = 1.0; else a_[1] = 1.0;
+                    double e1[3] = {u[1] * a_[2] - u[2] * a_[1], u[2] * a_[0] - u[0] * a_[2], u[0] * a_[1] - u[1] * a_[0]};
+                    double ne = __builtin_sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+                    if (ne > 1e-9) {
+                        e1[0] /= ne; e1[1] /= ne; e1[2] /= ne;
+                        double e2[3] = {u[1] * e1[2] - u[2] * e1[1], u[2] * e1[0] - u[0] * e1[2], u[0] * e1[1] - u[1] * e1[0]};
+                        int j0 = perm[0], j1 = la; double cc[3]; for (int p = 0; p < 3; p++) cc[p] = sXB[p] + rb * ct * u[p];
+                        double A1 = e1[j0], A2 = e2[j0], Am = __builtin_sqrt(A1 * A1 + A2 * A2);
+                        if (Am * rho > 1e-9) {
+                            double h = (xi[j0] - cc[j0]) / (rho * Am);
+                            if (h > -1.0 && h < 1.0) {
+                                double c0 = A1 / Am, s0 = A2 / Am, sd_ = __builtin_sqrt(1.0 - h * h), yb = 0.0, db = 1e300;
+                                for (int sgi = 0; sgi < 2; sgi++) {
+                                    double sn = sgi ? -sd_ : sd_, cph = c0 * h - s0 * sn, sph = s0 * h + c0 * sn;
+                                    double y = cc[j1] + rho * (cph * e1[j1] + sph * e2[j1]), dd = __builtin_fabs(y - spP[j1]);
+                                    if (dd < db) { db = dd; yb = y; }
+                                }
+                                if (sd_ > 0 && to_pred((yb - G->base[((size_t)t * N + i) * 3 + j1]) / G->s, &pred)) ab = abucket(1.0 / sd_);
+                            }
+                        }
+                    }
+                }
+            }
+            model_t *m = MM[lbl]; lab_t *lb = LB[lbl];
             /* disagreement between the prediction and the previous residual of the atom (uncertainty of the predictor) */
             uint32_t dis = uabs((int32_t)(pred - (int64_t)qp)); if (t == 0) dis = 0;
-            uint32_t gdis = (uint32_t)__builtin_fabs(fC3[ax] - (double)qp); if (gdis > 100000) gdis = 100000;
-            int32_t ep = Ep ? Ep[3 * i + ax] : 0, epp = Epp ? Epp[3 * i + ax] : 0;
-            int32_t er = (r >= 0) ? Ec[3 * r + ax] : 0, epr = (Ep && r >= 0) ? Ep[3 * r + ax] : 0;
-            int32_t ea = ax ? Ec[3 * i + ax - 1] : 0, eb = ax == 2 ? Ec[3 * i] : 0;
+            uint32_t gdis = (uint32_t)__builtin_fabs(fC3[la] - (double)qp); if (gdis > 100000) gdis = 100000;
+            int32_t ep = Ep ? Ep[3 * i + la] : 0, epp = Epp ? Epp[3 * i + la] : 0;
+            int32_t er = (r >= 0) ? Ec[3 * r + la] : 0, epr = (Ep && r >= 0) ? Ep[3 * r + la] : 0;
+            int32_t ea = ax ? Ec[3 * i + perm[ax - 1]] : 0, eb = ax == 2 ? Ec[3 * i + perm[0]] : 0;
             uint32_t aep = uabs(ep), aer = uabs(er), aepr = uabs(epr), aea = uabs(ea), aepp = uabs(epp);
             int bk = bucket(2 * aep + 2 * aer + aepr + aea);
             int bt = bucket(2 * aep + aepp + aepr); /* temporal activity */
             int32_t v = 0;
             if (!c->dec) {
-                int64_t ev = (int64_t)Qc[3 * i + ax] - pred;
-                if (ev > 2000000000LL || ev < -2000000000LL) { free(m); free(REC); for (int k = 0; k < 3; k++) free(EB[k]); return -3; }
+                int64_t ev = (int64_t)Qc[3 * i + la] - pred;
+                if (ev > 2000000000LL || ev < -2000000000LL) { for (int k = 0; k < 3; k++) { free(MM[k]); free(LB[k]); } free(REC); for (int k = 0; k < 3; k++) free(EB[k]); return -3; }
                 v = (int32_t)ev;
             }
             /* zero flag (bit = 1 means nonzero) */
-            pred_t P; P.nin = 6; P.w = &m->zw[g][bk]; P.apm = &m->za[g][ax];
-            P.m[0] = &m->z1[g][ax][bk]; P.m[1] = &m->z2[g][qb(aep)][qb(aer)]; P.m[2] = &m->z3[ax][qb(aepr)][qb(aea + uabs(eb))][aepp > 0];
+            pred_t P; P.nin = 6; P.w = &m->zw[g][bk]; P.apm = &m->za[g][la];
+            P.m[0] = &m->z1[g][la][bk]; P.m[1] = &m->z2[g][qb(aep)][qb(aer)]; P.m[2] = &m->z3[la][qb(aepr)][qb(aea + uabs(eb))][aepp > 0];
             P.m[3] = &m->z4[g][qb(aepp)][qb(aep)]; P.m[4] = &m->z5[bt][qb(aer)]; P.m[5] = &m->z6[g][qb(dis)][qb(gdis)];
+            if (lbl) { P.w = &lb->zw[g][ab]; P.m[P.nin++] = &lb->z7[ab][bk]; }
             int nz = code_mixed(c, &P, v != 0);
             if (nz) {
                 /* sign (bit = 1 means negative) */
-                pred_t S; S.nin = 3; S.w = &m->sw[g]; S.apm = &m->sa[ax];
-                S.m[0] = &m->s1[g][ax][sgn3(er)][sgn3(ep)]; S.m[1] = &m->s2[ax][sgn3(epr)][sgn3(ea)][sgn3(epp)]; S.m[2] = &m->s3[g][sgn3(qr - qpr)][sgn3(qp)];
+                pred_t S; S.nin = 3; S.w = &m->sw[g]; S.apm = &m->sa[la];
+                S.m[0] = &m->s1[g][la][sgn3(er)][sgn3(ep)]; S.m[1] = &m->s2[la][sgn3(epr)][sgn3(ea)][sgn3(epp)]; S.m[2] = &m->s3[g][sgn3(qr - qpr)][sgn3(qp)];
                 int neg = code_mixed(c, &S, v < 0);
                 uint32_t a = c->dec ? 0 : uabs(v); int n = c->dec ? 0 : bitlen(a);
                 /* unary length: bits 1 while j < n-1, then 0 */
@@ -255,8 +339,9 @@ static int run(coder_t *c, int32_t *Q, int T, int N, const int32_t *ref, const u
                     if (j >= 31) break;
                     int jj = j < NU ? j : NU - 1;
                     pred_t U; U.nin = 6; U.w = &m->uw[jj][bk]; U.apm = &m->ua[jj];
-                    U.m[0] = &m->u1[g][bk][jj]; U.m[1] = &m->u2[jj][qb(aep)][qb(aer)]; U.m[2] = &m->u3[jj][ax][qb(aepr + aea)];
+                    U.m[0] = &m->u1[g][bk][jj]; U.m[1] = &m->u2[jj][qb(aep)][qb(aer)]; U.m[2] = &m->u3[jj][la][qb(aepr + aea)];
                     U.m[3] = &m->u4[g][jj][qb(aepp)]; U.m[4] = &m->u5[jj][bt]; U.m[5] = &m->u6[jj][qb(dis)][qb(gdis)];
+                    if (lbl) { U.w = &lb->uw[jj][ab]; U.m[U.nin++] = &lb->u7[jj][ab][bk]; }
                     int more = code_mixed(c, &U, j < n - 1);
                     if (!more) break;
                     j++;
@@ -265,23 +350,24 @@ static int run(coder_t *c, int32_t *Q, int T, int N, const int32_t *ref, const u
                 uint32_t val = 1;
                 for (int k = n - 2; k >= 0; k--) {
                     int bit = c->dec ? 0 : (int)((a >> k) & 1);
-                    bit = (k == n - 2) ? code_simple(c, &m->mtop[n][bk], bit) : code_simple(c, &m->mbit[n][k], bit);
+                    bit = (k == n - 2) ? code_simple(c, lbl ? &lb->mt[n][ab][bk] : &m->mtop[n][bk], bit) : code_simple(c, &m->mbit[n][k], bit);
                     val = (val << 1) | (uint32_t)bit;
                 }
                 if (c->dec) v = neg ? -(int32_t)val : (int32_t)val;
             }
-            Ec[3 * i + ax] = v;
-            if (c->dec) Qc[3 * i + ax] = (int32_t)(pred + v);
-            REC[(size_t)(t & 1) * N * 3 + (size_t)i * 3 + ax] = G->base[((size_t)t * N + i) * 3 + ax] + G->s * (double)Qc[3 * i + ax];
+            Ec[3 * i + la] = v;
+            if (c->dec) Qc[3 * i + la] = (int32_t)(pred + v);
+            REC[(size_t)(t & 1) * N * 3 + (size_t)i * 3 + la] = G->base[((size_t)t * N + i) * 3 + la] + G->s * (double)Qc[3 * i + la];
         }
     }
-    free(m); free(REC); for (int k = 0; k < 3; k++) free(EB[k]);
+    for (int k = 0; k < 3; k++) { free(MM[k]); free(LB[k]); } free(REC); for (int k = 0; k < 3; k++) free(EB[k]);
     return 0;
 }
 
 int64_t re_encode(const int32_t *Q, int T, int N, const int32_t *ref, const uint8_t *cls, const int16_t *coef,
-                  const double *base, double s, const double *Xc, int Nc, const int32_t *R3, uint8_t *out, int64_t cap) {
-    geo_t G = {base, s, Xc, Nc, R3};
+                  const double *base, double s, const double *Xc, int Nc, const int32_t *R3, uint8_t *out, int64_t cap,
+                  int smode, const int32_t *plan, const double *rb, const double *ct) {
+    geo_t G = {base, s, Xc, Nc, R3, smode, plan, rb, ct};
     coder_t c; memset(&c, 0, sizeof(c)); c.dec = 0;
     c.e.low = 0; c.e.range = 0xFFFFFFFFu; c.e.cache = 0; c.e.csize = 1; c.e.out = out; c.e.pos = 0; c.e.cap = cap; c.e.err = 0;
     int rc = run(&c, (int32_t *)Q, T, N, ref, cls, coef, &G);
@@ -291,8 +377,9 @@ int64_t re_encode(const int32_t *Q, int T, int N, const int32_t *ref, const uint
 }
 
 int re_decode(const uint8_t *in, int64_t len, int T, int N, const int32_t *ref, const uint8_t *cls, const int16_t *coef,
-              const double *base, double s, const double *Xc, int Nc, const int32_t *R3, int32_t *Q) {
-    geo_t G = {base, s, Xc, Nc, R3};
+              const double *base, double s, const double *Xc, int Nc, const int32_t *R3, int32_t *Q,
+              int smode, const int32_t *plan, const double *rb, const double *ct) {
+    geo_t G = {base, s, Xc, Nc, R3, smode, plan, rb, ct};
     coder_t c; memset(&c, 0, sizeof(c)); c.dec = 1;
     c.d.code = 0; c.d.range = 0xFFFFFFFFu; c.d.in = in; c.d.pos = 0; c.d.len = len;
     for (int k = 0; k < 5; k++) c.d.code = (c.d.code << 8) | getb(&c.d);
