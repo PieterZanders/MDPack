@@ -295,7 +295,7 @@ def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_s
     if not np.array_equal(qd, q): raise RuntimeError("coder roundtrip mismatch")
     W.sec(blob)
     used = dict(nc_predictor=nc_predictor, nc_coder=nc_coder, kind=kind)
-    if nc_coder == "ac" and nc_sphere != "off": used.update(nc_sphere=nc_sphere, nc_smode=inf["smode"])   # off: header unchanged
+    if nc_coder == "ac" and inf.get("smode", "off") != "off": used.update(nc_sphere=nc_sphere, nc_smode=inf["smode"])   # off (also when auto picks it): header unchanged
     return W.b.getvalue(), used, b
 
 
