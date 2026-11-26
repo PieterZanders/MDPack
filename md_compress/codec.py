@@ -479,7 +479,7 @@ def compress(coords, aatype, atom_mask, chain_index, chain_break, bound=None, ba
     """atom14 protein trajectory -> .mdz bytes.
     method 'hybrid' (default; bound default 0.1, backbone / full_predictor flags) or one of md_compress.methods.METHODS
     ('xtc', 'tng', 'mdcompress', 'new-coder', 'lzma', 'zstd', 'bz2') with that method's options as keyword arguments
-    (xtc_precision, tng_precision, mdc_res, mdc_level, mdc_preset, mdc_batch, mdc_history, nc_predictor, level, delta).
+    (xtc_precision, tng_precision, mdc_res, mdc_level, mdc_preset, mdc_batch, mdc_history, nc_predictor, nc_coder, nc_sphere, level, delta).
     bound: Angstrom, 0 / 'lossless' (0.01 A grid), 'exact' (float32 bits; lzma / zstd / bz2 only) or None (method default)."""
     from md_compress import report as RP
     t0 = time.time(); mk0 = np.asarray(atom_mask) > 0; Mx0 = 0 if extra is None else int(np.asarray(extra).shape[1])
@@ -577,7 +577,7 @@ def _decompress_core(blob, threads=4):
 
 # ---------------------------------------------------------------- files and CLI
 OPTS = {"hybrid": ("coder", "residuals", "angle_model"), "hybrid-ae": ("coder", "angle_model"), "model-only": ("angle_model",), "xtc": ("xtc_precision",), "tng": ("tng_precision",),
-        "mdcompress": ("mdc_res", "mdc_level", "mdc_preset", "mdc_batch", "mdc_history"), "new-coder": ("nc_predictor", "nc_coder"),
+        "mdcompress": ("mdc_res", "mdc_level", "mdc_preset", "mdc_batch", "mdc_history"), "new-coder": ("nc_predictor", "nc_coder", "nc_sphere"),
         "lzma": ("level", "delta"), "zstd": ("level", "delta"), "bz2": ("level", "delta"), "gzip": ("level", "delta"),
         "trr": ("trr_double",), "dcd": (), "netcdf": (), "pdb": ("pdb_precision", "pdb_gzip"),
         "h5md": ("h5md_compression", "h5md_level", "h5md_chunk", "h5md_sz3_abs"),
@@ -710,6 +710,8 @@ def main(argv=None):
     g.add_argument("--mdc-level", type=int, help="-l level (default 2)"); g.add_argument("--mdc-preset", choices=["default", "archive", "trajectory", "frames"])
     g.add_argument("--mdc-batch", type=int, help="-b frames per batch"); g.add_argument("--mdc-history", type=int, help="-h 1..3")
     g = c.add_argument_group("new-coder"); g.add_argument("--nc-predictor", choices=["mean", "raw"]); g.add_argument("--nc-coder", choices=["ac", "lzma"])
+    g.add_argument("--nc-sphere", choices=["auto", "off", "sphere", "circle"],
+                   help="bond sphere prediction in the coder (blob version 5): auto (default; the smallest of off, sphere, sphere plus circle), off (version 4 as before), sphere, circle (sphere plus circle)")
     g = c.add_argument_group("lzma / zstd / bz2 / gzip"); g.add_argument("--level", type=int); g.add_argument("--delta", choices=["time", "none"])
     g = c.add_argument_group("trr / pdb"); g.add_argument("--trr-double", action="store_const", const=True, help="trr in float64")
     g.add_argument("--pdb-precision", type=int, help="decimals 0..3 (default 3)"); g.add_argument("--pdb-gzip", type=int, help="gzip level for the PDB text")

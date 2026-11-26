@@ -15,6 +15,10 @@ payload in the .mdz container, whose header records the method id and its option
   new-coder   model free quantisation + the context modelled arithmetic coder (gpu/residual_entropy.c), no network.
               nc_predictor = 'mean' (default: mean structure after a per frame rigid fit) or 'raw' (coordinates
               themselves; the coder's temporal context does the prediction). bound in Angstrom or lossless (0.01 A grid).
+              nc_sphere = 'auto' (default: the coder picks the smallest of off, sphere and sphere plus circle per file),
+              'off' (coder blob version 4, as before), 'sphere' or 'circle' (sphere plus circle): the last coded axis of an
+              atom is predicted from the sphere around a bonded neighbour (neighbours found from the coordinates and stored),
+              see gpu/residual_entropy.c.
   dvorak      PMC, the authors' own tool for Dvorak, Manak and Vasa, J Mol Graph Model 96 (2020) 107531: bonds are
               traversed from an entrance atom; each atom's newly reached bonded neighbours are predicted from a canonical
               molecule rotated into the local frame of the bond to its predecessor (a quantised rotation angle about that
@@ -262,13 +266,14 @@ def dec_generic(name, data, T, N, opts, threads=4):
 
 
 # ---------------------------------------------------------------- model free + new coder
-def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", **_):
+def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_sphere="auto", **_):
     from md_compress import codec as C
     RCD, RE = E["RCD"], E["RE"]
     kind, b = _bound(bound)
     if kind is None: kind, b = "grid", 0.1
     if kind == "exact": raise ValueError("new-coder is grid based; use a bound or lossless (0.01 A grid)")
     if nc_predictor not in ("mean", "raw"): raise ValueError("nc_predictor must be 'mean' or 'raw'")
+    if nc_sphere not in ("auto", "off", "sphere", "circle"): raise ValueError("nc_sphere must be 'auto', 'off', 'sphere' or 'circle'")
     import torch
     truth = np.asarray(x, np.float64); T = len(truth)
     xf = torch.as_tensor(truth, dtype=torch.float32); Mn = RCD.iter_mean(xf).float(); Mnp = Mn.numpy().astype(np.float64)
@@ -285,11 +290,13 @@ def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", **_)
     if nc_coder == "lzma":  # the report's 'model free mean' / 'model free raw' rows (best lzma arrangement per stream)
         blob = C._lz_enc(RCD, q); qd = C._lz_dec(RCD, blob, q.shape)
     elif nc_coder == "ac":
-        blob, _ = RE.encode(q, cls, base, st, RE.make_refs(Mnp), RE.make_refs3(Mnp, None), None); qd = RE.decode(blob, q.shape, cls, base, st, None)
+        blob, inf = RE.encode(q, cls, base, st, RE.make_refs(Mnp), RE.make_refs3(Mnp, None), None, sphere=nc_sphere); qd = RE.decode(blob, q.shape, cls, base, st, None)
     else: raise ValueError("nc_coder must be 'ac' or 'lzma'")
     if not np.array_equal(qd, q): raise RuntimeError("coder roundtrip mismatch")
     W.sec(blob)
-    return W.b.getvalue(), dict(nc_predictor=nc_predictor, nc_coder=nc_coder, kind=kind), b
+    used = dict(nc_predictor=nc_predictor, nc_coder=nc_coder, kind=kind)
+    if nc_coder == "ac" and nc_sphere != "off": used.update(nc_sphere=nc_sphere, nc_smode=inf["smode"])   # off: header unchanged
+    return W.b.getvalue(), used, b
 
 
 def dec_newcoder(data, T, N, opts, cls, E):
