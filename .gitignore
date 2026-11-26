@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Native extension: residual_entropy.py compiles this on first import
+gpu/_residual_entropy.so
+gpu/_residual_entropy.so.tmp
+
+# Local environments
+.venv/
+venv/
+envs/
+.env
+
+# Trajectories and local data (fixtures under tests/ are tracked)
+data/
+*.xtc
+*.trr
+*.dcd
+*.h5
+
+# Local training and example outputs at the repo root (results_gpu is tracked)
+/results/
+/results_frame/
+/results_multi/
+/results_noprior/
+/results_vonmises/
+
+# Logs, dumps, archives, build output
+*.log
+logs/
+benchmark/entropy/logs/
+benchmark/entropy/dumps/
+benchmark/entropy/dev/
+*.zip
+dist/
+build/
+out/
+coverage/
+target/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Generated reports, figures and section markdown (rebuild with ./reproduce.sh --stage report)
+benchmark/benchmark_report.md
+benchmark/benchmark_report.html
+benchmark/benchmark_report.pdf
+benchmark/figs/
+benchmark/entropy/*_section.md
+benchmark/entropy/readme_results_block.md
+
+# Generated result dumps and logs (rebuild with the data, baselines, entropy, scaling, ablation and codec stages)
+benchmark/results/
+benchmark/entropy/results/
+benchmark/entropy/logs/
+benchmark/entropy/dumps/
+**/STATE.md
+
+# Generated evaluation writeups and training histories (keep runs/*/best.pt, runs/*/config.json, frames/selected_domains.json)
+results_gpu/eval/
+results_gpu/colab_manifest/
+results_gpu/finetune/
+results_gpu/residuals/
+results_gpu/rotcodes/
+results_gpu/scaling/
+results_gpu/stability/
+results_gpu/**/history.json
+results_gpu/**/section.md
+results_gpu/**/tables.md
+results_gpu/**/page_section_pending.md
+results_gpu/**/partA.txt
+results_gpu/**/partB.txt
+results_gpu/**/partC.txt
+results_gpu/summary.json
+results_gpu/summary.md
+results_gpu/summary_stability.md
+results_gpu/dynamics.json
+results_gpu/dynamics_table.md
+results_gpu/frames/mdcath_lengths.json

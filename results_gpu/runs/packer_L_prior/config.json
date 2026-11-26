@@ -1,0 +1,21 @@
+{
+ "stage": "packer",
+ "variant": "L",
+ "prior": true,
+ "bs": 16,
+ "lr": 0.001,
+ "minutes": 30.0,
+ "clash": 0.1,
+ "params": {
+  "codec": 101432,
+  "mapping_net": 448448,
+  "sidechain_model": 296104,
+  "sidechain_stack_total": 744552,
+  "total": 845984
+ },
+ "n_train_domains": 300,
+ "n_val_domains": 30,
+ "init_codec": null,
+ "init_packer": null,
+ "gpu": "NVIDIA L4"
+}

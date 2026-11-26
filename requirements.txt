@@ -1,0 +1,10 @@
+torch>=2.1          # tested with 2.14 (CPU)
+numpy>=1.24
+scipy>=1.10         # quaternion <-> rotation matrix
+MDAnalysis>=2.6     # trajectory I/O (tested 2.10)
+# optional: MDAnalysisTests (source of the ADK example files; already copied into data/)
+# optional backends used by --method flags (install only what you need):
+# zstandard          # --method zstd
+# h5py               # --method h5md
+# hdf5plugin         # --method h5md --h5md-compression sz3
+# netCDF4            # --method netcdf

@@ -1,0 +1,21 @@
+{
+ "stage": "e2e",
+ "variant": "S",
+ "prior": true,
+ "bs": 16,
+ "lr": 0.0003,
+ "minutes": 10.0,
+ "clash": 0.1,
+ "params": {
+  "codec": 101432,
+  "mapping_net": 53536,
+  "sidechain_model": 32504,
+  "sidechain_stack_total": 86040,
+  "total": 187472
+ },
+ "n_train_domains": 300,
+ "n_val_domains": 30,
+ "init_codec": "/content/runs/codec_S_prior/best.pt",
+ "init_packer": "/content/runs/packer_S_prior/best.pt",
+ "gpu": "NVIDIA L4"
+}
