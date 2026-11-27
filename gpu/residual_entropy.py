@@ -162,15 +162,18 @@ def _cost(e):
     return np.log2(1.0 + np.abs(e)).sum()
 
 
-def encode(q, cls, base, s, ref, R3, Xc=None, n_try=3, force=None, sphere="off", plan=None, margin=0):
+def encode(q, cls, base, s, ref, R3, Xc=None, n_try=3, force=None, sphere="off", plan=None, plan_x=None, choose="full", sub_frames=128, diag=False):
     """q int [T,N,3] residual integers of a stream with float base predictor `base` and step s (x_rec = base + s q).
     Returns (blob, info). Candidate predictors are scored per atom class with a code length proxy; the best per class
     combination and the best global candidates are entropy coded and the smallest is kept.
     sphere: 'off' (version 4, unchanged), 'sphere' or 'circle' (sphere plus circle; forced, version 5) or 'auto' (the
-    smallest of off, sphere and sphere plus circle, each coded with the predictor chosen with the sphere off; a file is
-    never larger than with 'off'). Forced modes fall back to version 4 only when no atom has a neighbour or T < 2. plan: [N,3] (B, C, cur) bonded neighbours, default
-    bond_plan() of the reconstructed positions; stored in the blob. margin: bytes the caller adds outside the blob when a
-    sphere mode is used (container option fields); auto keeps a sphere mode only if it is smaller than off by more than that."""
+    smallest blob of off, sphere and sphere plus circle, each coded with the predictor chosen with the sphere off; the
+    blob is never larger than with 'off'). Forced modes fall back to version 4 only when no atom has a neighbour or T < 2.
+    plan: [N,3] (B, C, cur) bonded neighbours, stored in the blob; default bond_plan(plan_x) when the encoder passes the
+    original coordinates plan_x [T,N,3], else bond_plan() of the reconstructed positions.
+    choose (auto only): 'full' codes every mode on all frames; 'sub' compares the modes on the first sub_frames frames
+    and codes only the winner on all frames (kept only if smaller than off). diag: also record both choices and the time
+    of every pass in info (analysis; the output is then the full choice)."""
     q = np.ascontiguousarray(q, np.int32); T, N, _ = q.shape
     ref = np.ascontiguousarray(ref, np.int32); cls = np.ascontiguousarray(cls, np.uint8); R3 = np.ascontiguousarray(R3, np.int32)
     assert len(ref) == N == len(cls) == len(R3) and (ref < np.arange(N)).all() and cls.max(initial=0) < NG
@@ -212,19 +215,43 @@ def encode(q, cls, base, s, ref, R3, Xc=None, n_try=3, force=None, sphere="off",
     modes = {"auto": ("sphere", "circle"), "sphere": ("sphere",), "circle": ("circle",)}[sphere]
     if T < 2 or N < 2: return out   # nothing to predict from: frame 0 is never sphere coded
     rec = base + s * q.astype(np.float64)
-    P = bond_plan(rec) if plan is None else np.ascontiguousarray(plan, np.int32)
+    P = (bond_plan(plan_x) if plan_x is not None else bond_plan(rec)) if plan is None else np.ascontiguousarray(plan, np.int32)
     assert P.shape == (N, 3); okp = P[:, 0] >= 0; i_ = np.arange(N)
     assert (P[okp, 0] < i_[okp]).all() and (P[okp, 1] >= 0).all() and (P[okp, 1] < N).all() and ((P[okp, 2] == 0) | (P[okp, 1] < i_[okp])).all()
     if not okp.any(): return out
     rbq, ctq = bond_stats(rec, P)
     hp = _pack(np.stack([np.where(okp, i_ - P[:, 0], 0), np.where(okp, i_ - P[:, 1], 0), np.where(okp, P[:, 2], 0)], 1), np.int32) + _pack(rbq, np.uint16)
-    sizes_m = {"off": len(out[0])}
-    for nm in modes:
-        sm = SMODES[nm]; b5 = _enc(q, ref, cls, W, base, s, xc, Nc, R3.reshape(-1), sm, P, rbq.astype(np.float64) * 1e-3, ctq.astype(np.float64) * 1e-4)
-        h5 = bytes([VERSION_SPHERE]) + hdr0 + bytes([sm]) + hp + (_pack(ctq, np.int16) if sm == 2 else b"")
-        sizes_m[nm] = len(h5) + len(b5)
-        if sphere != "auto" or len(h5) + len(b5) + margin < (len(out[0]) if out[1]["smode"] == "off" else len(out[0]) + margin): out = (h5 + b5, dict(out[1], header_bytes=len(h5), smode=nm))
+    rbf, ctf = rbq.astype(np.float64) * 1e-3, ctq.astype(np.float64) * 1e-4
+    h5 = {nm: bytes([VERSION_SPHERE]) + hdr0 + bytes([SMODES[nm]]) + hp + (_pack(ctq, np.int16) if nm == "circle" else b"") for nm in modes}
+    import time as _t
+    def full(nm):
+        t0 = _t.perf_counter(); b5 = h5[nm] + _enc(q, ref, cls, W, base, s, xc, Nc, R3.reshape(-1), SMODES[nm], P, rbf, ctf); return b5, _t.perf_counter() - t0
+    def pick(sz):
+        return min(sz, key=lambda k: (sz[k], k != "off"))   # ties go to off
+    use_sub = sphere == "auto" and (choose == "sub" or diag) and T > sub_frames
+    sub = {}; t_sub = 0.0
+    if use_sub:
+        S = sub_frames; t0 = _t.perf_counter(); bs, ss, xcs, Ncs = _geo(base[:S], s, None if Xc is None else Xc[:S], N, S); qs = np.ascontiguousarray(q[:S])
+        sub["off"] = len(hdr) + len(_enc(qs, ref, cls, W, bs, ss, xcs, Ncs, R3.reshape(-1)))
+        for nm in modes: sub[nm] = len(h5[nm]) + len(_enc(qs, ref, cls, W, bs, ss, xcs, Ncs, R3.reshape(-1), SMODES[nm], P, rbf, ctf))
+        t_sub = _t.perf_counter() - t0
+    sizes_m = {"off": len(out[0])}; tf = {}
+    if sphere != "auto":
+        for nm in modes:
+            b5, tf[nm] = full(nm); sizes_m[nm] = len(b5); out = (b5, dict(out[1], header_bytes=len(h5[nm]), smode=nm))
+    elif choose == "sub" and use_sub and not diag:
+        nm = pick(sub)
+        if nm != "off":
+            b5, tf[nm] = full(nm); sizes_m[nm] = len(b5)
+            if len(b5) < len(out[0]): out = (b5, dict(out[1], header_bytes=len(h5[nm]), smode=nm))
+    else:
+        blobs = {}
+        for nm in modes: blobs[nm], tf[nm] = full(nm); sizes_m[nm] = len(blobs[nm])
+        nm = pick(sizes_m)
+        if nm != "off": out = (blobs[nm], dict(out[1], header_bytes=len(h5[nm]), smode=nm))
     out[1]["smode_sizes"] = sizes_m
+    if diag: out[1]["diag"] = dict(sub=sub, sub_frames=sub_frames if use_sub else None, choice_full=pick(sizes_m) if len(sizes_m) > 1 else "off",
+                                   choice_sub=pick(sub) if sub else None, t_sub=t_sub, t_full=tf)
     return out
 
 

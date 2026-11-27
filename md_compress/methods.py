@@ -266,17 +266,7 @@ def dec_generic(name, data, T, N, opts, threads=4):
 
 
 # ---------------------------------------------------------------- model free + new coder
-def sphere_option_bytes(nc_sphere="auto"):
-    """upper bound on the bytes a sphere mode adds outside the coder blob: the nc_sphere / nc_smode option fields in the
-    container header (json) plus the same fields in the metadata trailer (counted uncompressed), plus 8 bytes of slack for
-    zlib and run to run trailer variation. nc_sphere auto uses it so that a whole file is never larger than with off."""
-    import json
-    u0 = dict(nc_predictor="raw", nc_coder="ac", kind="lossless"); u1 = dict(u0, nc_sphere=nc_sphere, nc_smode="circle")
-    core = len(json.dumps(u1)) - len(json.dumps(u0)); trailer = len(json.dumps(u1, separators=(",", ":"))) - len(json.dumps(u0, separators=(",", ":")))
-    return core + trailer + 8
-
-
-def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_sphere="auto", **_):
+def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_sphere="auto", nc_choose="full", **_):
     from md_compress import codec as C
     RCD, RE = E["RCD"], E["RE"]
     kind, b = _bound(bound)
@@ -284,6 +274,7 @@ def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_s
     if kind == "exact": raise ValueError("new-coder is grid based; use a bound or lossless (0.01 A grid)")
     if nc_predictor not in ("mean", "raw"): raise ValueError("nc_predictor must be 'mean' or 'raw'")
     if nc_sphere not in ("auto", "off", "sphere", "circle"): raise ValueError("nc_sphere must be 'auto', 'off', 'sphere' or 'circle'")
+    if nc_choose not in ("full", "sub"): raise ValueError("nc_choose must be 'full' or 'sub'")
     import torch
     truth = np.asarray(x, np.float64); T = len(truth)
     xf = torch.as_tensor(truth, dtype=torch.float32); Mn = RCD.iter_mean(xf).float(); Mnp = Mn.numpy().astype(np.float64)
@@ -300,13 +291,16 @@ def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_s
     if nc_coder == "lzma":  # the report's 'model free mean' / 'model free raw' rows (best lzma arrangement per stream)
         blob = C._lz_enc(RCD, q); qd = C._lz_dec(RCD, blob, q.shape)
     elif nc_coder == "ac":
-        blob, inf = RE.encode(q, cls, base, st, RE.make_refs(Mnp), RE.make_refs3(Mnp, None), None, sphere=nc_sphere,
-                              margin=sphere_option_bytes(nc_sphere) if nc_sphere == "auto" else 0); qd = RE.decode(blob, q.shape, cls, base, st, None)
+        # bonds for the sphere are chosen from the original coordinates (stored in the blob, so the decoder does not need them)
+        blob, inf = RE.encode(q, cls, base, st, RE.make_refs(Mnp), RE.make_refs3(Mnp, None), None, sphere=nc_sphere, plan_x=truth,
+                              choose=nc_choose, diag=bool(os.environ.get("MDPACK_SPHERE_DIAG"))); qd = RE.decode(blob, q.shape, cls, base, st, None)
     else: raise ValueError("nc_coder must be 'ac' or 'lzma'")
     if not np.array_equal(qd, q): raise RuntimeError("coder roundtrip mismatch")
     W.sec(blob)
     used = dict(nc_predictor=nc_predictor, nc_coder=nc_coder, kind=kind)
-    if nc_coder == "ac" and inf.get("smode", "off") != "off": used.update(nc_sphere=nc_sphere, nc_smode=inf["smode"])   # off (also when auto picks it): header unchanged
+    # the sphere mode is not written to the options: the coder blob version carries it, so the container and the metadata
+    # trailer are the same for every mode and comparing blob sizes compares whole file sizes. '_' keys stay in memory only.
+    if nc_coder == "ac": used.update(_nc_smode=inf.get("smode", "off"), _nc_smode_sizes=inf.get("smode_sizes"), _nc_diag=inf.get("diag"))
     return W.b.getvalue(), used, b
 
 

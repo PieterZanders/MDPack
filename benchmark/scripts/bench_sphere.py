@@ -36,7 +36,7 @@ def flat(d, r):
 
 SPEC = {"nc_raw_off": ("new-coder", dict(nc_predictor="raw", nc_sphere="off")), "nc_raw_auto": ("new-coder", dict(nc_predictor="raw", nc_sphere="auto")),
         "nc_mean_off": ("new-coder", dict(nc_predictor="mean", nc_sphere="off")), "nc_mean_auto": ("new-coder", dict(nc_predictor="mean", nc_sphere="auto")),
-        "hybrid": ("hybrid", {}), "mdc_l2": ("mdcompress", {}), "mdc_l4a": ("mdcompress", dict(mdc_level=4, mdc_preset="archive"))}
+        "hybrid": ("hybrid", {}), "hybrid_full": ("hybrid", dict(full_predictor=True)), "mdc_l2": ("mdcompress", {}), "mdc_l4a": ("mdcompress", dict(mdc_level=4, mdc_preset="archive"))}
 
 E = C._env(a.threads); RE = E["RE"]; _orig = RE.encode; HY = []; DT = []; _odec = C.decompress
 
@@ -83,7 +83,8 @@ for sysn in [x for x in a.systems.split(",") if x not in EXCLUDE]:
                         x, y = flat(d, r); err = float(np.abs(y.astype(np.float64) - x).max())
                     rec.update(bytes=len(blob), raw_bytes=12 * x.shape[0] * x.shape[1], ratio=12 * x.shape[0] * x.shape[1] / len(blob),
                                encode_s=te, decode_s=td, max_err=err, within=bool(err <= lim + 1e-5), N=int(x.shape[1]),
-                               smode=(info.get("options") or {}).get("nc_smode"))
+                               smode=(info.get("options") or {}).get("_nc_smode"), smode_sizes=(info.get("options") or {}).get("_nc_smode_sizes"),
+                               diag=(info.get("options") or {}).get("_nc_diag"))
                     if mname.startswith("nc_"):
                         dec[(bd, mname)] = y
                         if mname.endswith("_auto") and (bd, mname.replace("auto", "off")) in dec:

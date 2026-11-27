@@ -65,32 +65,36 @@ def test_off_is_version4():
         else: assert len(c) <= len(a)
 
 
-def test_auto_counts_option_bytes():
-    """nc_sphere auto must count the container option bytes: (1) a margin larger than any saving gives the off blob,
-    (2) the measured whole file overhead of the option fields is within methods.sphere_option_bytes(), so a file picked
-    by auto is never larger than with off."""
-    from md_compress import methods as MT
-    from md_compress.codec import compress_xyz
-    RE = _re(); x = _xyz20(); xd = x.astype(np.float64); q = np.round(xd / 0.01).astype(np.int64); N = q.shape[1]
+def test_auto_never_larger_than_off():
+    """the sphere mode is not written to the container options, so the container and the trailer are the same for every
+    mode and auto (full or subsample choice) can only give a file that is at most the size of the off file; bonds are
+    chosen from the original coordinates."""
+    import json, struct
+    from md_compress.codec import compress_xyz, decompress
+    x = _xyz20()
+    for bd in ("lossless", 0.1, 0.5):
+        fo = compress_xyz(x, "new-coder", bd, 1, nc_predictor="raw", nc_sphere="off", metadata=False)
+        for ch in ("full", "sub"):
+            fa = compress_xyz(x, "new-coder", bd, 1, nc_predictor="raw", nc_sphere="auto", nc_choose=ch, metadata=False)
+            assert len(fa) <= len(fo), (bd, ch, len(fa), len(fo))
+            assert np.array_equal(decompress(fa, 1, report=False)["xyz"], decompress(fo, 1, report=False)["xyz"])
+        fs = compress_xyz(x, "new-coder", bd, 1, nc_predictor="raw", nc_sphere="circle", metadata=False)
+        assert b"nc_smode" not in fs and b"nc_sphere" not in fs
+    RE = _re(); xd = x.astype(np.float64); q = np.round(xd / 0.01).astype(np.int64); N = q.shape[1]
     base = np.zeros_like(xd); cls = np.full(N, 11, np.uint8); M = xd.mean(0); args = (q, cls, base, 0.01, RE.make_refs(M), RE.make_refs3(M))
-    off, _ = RE.encode(*args); big, inf = RE.encode(*args, sphere="auto", margin=10 ** 9)
-    assert big == off and inf["smode"] == "off"
-    a0, i0 = RE.encode(*args, sphere="auto"); assert i0["smode"] != "off"   # the sphere wins on this input
-    m = i0["smode_sizes"]["off"] - i0["smode_sizes"][i0["smode"]]
-    a1, i1 = RE.encode(*args, sphere="auto", margin=m); assert a1 == off   # saving not above the margin: off
-    a2, i2 = RE.encode(*args, sphere="auto", margin=m - 1); assert i2["smode"] == i0["smode"]
-    # whole file overhead of the option fields (forced mode, so the coder blob sizes are known)
-    rec = {}; enc0 = RE.encode
-    def spy(*a, **k):
-        r = enc0(*a, **k); rec[k.get("sphere")] = len(r[0]); return r
-    RE.encode = spy
-    try:
-        fo = compress_xyz(x, "new-coder", "lossless", 1, nc_predictor="raw", nc_sphere="off")
-        fs = compress_xyz(x, "new-coder", "lossless", 1, nc_predictor="raw", nc_sphere="circle")
-    finally: RE.encode = enc0
-    overhead = (len(fs) - len(fo)) - (rec["circle"] - rec["off"])
-    print("option overhead", overhead, "margin", MT.sphere_option_bytes()); assert 0 < overhead <= MT.sphere_option_bytes(), (overhead, MT.sphere_option_bytes())
-    fa = compress_xyz(x, "new-coder", "lossless", 1, nc_predictor="raw", nc_sphere="auto"); assert len(fa) <= len(fo) + 8
+    off, _ = RE.encode(*args)
+    for ch in ("full", "sub"):
+        b, inf = RE.encode(*args, sphere="auto", choose=ch, sub_frames=8, plan_x=xd); assert len(b) <= len(off)
+        assert np.array_equal(RE.decode(b, q.shape, cls, base, 0.01), q)
+    b, inf = RE.encode(*args, sphere="auto", sub_frames=8, plan_x=xd, diag=True)
+    assert inf["diag"]["choice_full"] in ("off", "sphere", "circle") and inf["diag"]["choice_sub"] in ("off", "sphere", "circle")
+    seen = []; bp = RE.bond_plan
+    def spy(X, *a, **k):
+        seen.append(np.array(X)); return bp(X, *a, **k)
+    RE.bond_plan = spy
+    try: compress_xyz(x, "new-coder", 0.5, 1, nc_predictor="raw", nc_sphere="sphere", metadata=False)
+    finally: RE.bond_plan = bp
+    assert len(seen) == 1 and np.allclose(seen[0], x, atol=1e-6)   # the originals, not the 1 A grid positions
 
 
 def _files(tmp, T=40):
