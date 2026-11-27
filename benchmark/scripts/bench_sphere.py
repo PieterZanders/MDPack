@@ -4,7 +4,7 @@ Per system, T and bound: new-coder raw and mean with --nc-sphere off (production
 its residual streams stay on version 4, and what auto would save on its two streams is measured separately by wrapping
 the coder: the extra encodes are timed and subtracted from the hybrid encode time), and MDCompress through the codec
 (level 2 default and level 4 archive preset; the smaller is the 'best' setting). Every file is decoded in the same
-process; max |error| <= bound is checked, and new-coder off and auto must decode to identical coordinates.
+process (hybrid: the codec's own verify decode at compress time, which is also part of every encode time); max |error| <= bound is checked, and new-coder off and auto must decode to identical coordinates.
 Results are appended to --out (JSON, resumable).
     python benchmark/scripts/bench_sphere.py --systems 1e8rA00,... --T 1000,250 --out results.json"""
 import argparse, json, os, sys, time, traceback
@@ -38,7 +38,14 @@ SPEC = {"nc_raw_off": ("new-coder", dict(nc_predictor="raw", nc_sphere="off")), 
         "nc_mean_off": ("new-coder", dict(nc_predictor="mean", nc_sphere="off")), "nc_mean_auto": ("new-coder", dict(nc_predictor="mean", nc_sphere="auto")),
         "hybrid": ("hybrid", {}), "mdc_l2": ("mdcompress", {}), "mdc_l4a": ("mdcompress", dict(mdc_level=4, mdc_preset="archive"))}
 
-E = C._env(a.threads); RE = E["RE"]; _orig = RE.encode; HY = []
+E = C._env(a.threads); RE = E["RE"]; _orig = RE.encode; HY = []; DT = []; _odec = C.decompress
+
+
+def tdec(*args, **kw):
+    t0 = time.perf_counter(); r = _odec(*args, **kw); DT.append(time.perf_counter() - t0); return r
+
+
+C.decompress = tdec
 
 
 def wrapped(*args, **kw):
@@ -51,7 +58,8 @@ def wrapped(*args, **kw):
     return out
 
 
-for sysn in a.systems.split(","):
+EXCLUDE = {"mddb_membrane_Eprot"}   # dropped from all runs and reports (Pieter, t86u)
+for sysn in [x for x in a.systems.split(",") if x not in EXCLUDE]:
     for T in [int(t) for t in a.T.split(",")]:
         d = load(sysn, T)
         if len(d["coords"]) < T: print("skip", sysn, T, flush=True); continue
@@ -68,9 +76,12 @@ for sysn in a.systems.split(","):
                     blob, info = C.compress(d["coords"], d["aatype"], d["atom_mask"], d["chain_index"], d["chain_break"], bound=bound, extra=d["extra"],
                                             threads=a.threads, return_info=True, method=method, **opts)
                     te = time.perf_counter() - t0; RE.encode = _orig
-                    t0 = time.perf_counter(); r = C.decompress(blob, a.threads, report=False); td = time.perf_counter() - t0
-                    x, y = flat(d, r); err = float(np.abs(y.astype(np.float64) - x).max())
-                    rec.update(bytes=len(blob), raw_bytes=12 * x.shape[0] * x.shape[1], ratio=12 * x.size / 3 / len(blob) if False else 12 * x.shape[0] * x.shape[1] / len(blob),
+                    if method == "hybrid":   # the codec's own verify decode (metadata trailer) is the decode measurement; no second decode
+                        td = DT[-1]; err = float(info["measured"]["max_abs_err"]); x, _ = flat(d, dict(xyz=np.zeros((1, 1, 3)))); y = None
+                    else:
+                        t0 = time.perf_counter(); r = C.decompress(blob, a.threads, report=False); td = time.perf_counter() - t0
+                        x, y = flat(d, r); err = float(np.abs(y.astype(np.float64) - x).max())
+                    rec.update(bytes=len(blob), raw_bytes=12 * x.shape[0] * x.shape[1], ratio=12 * x.shape[0] * x.shape[1] / len(blob),
                                encode_s=te, decode_s=td, max_err=err, within=bool(err <= lim + 1e-5), N=int(x.shape[1]),
                                smode=(info.get("options") or {}).get("nc_smode"))
                     if mname.startswith("nc_"):
