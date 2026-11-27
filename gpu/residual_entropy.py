@@ -110,7 +110,10 @@ def bond_plan(X, nsub=64, rmax=2.1, smax=0.12):
     X = np.asarray(X, np.float64); T, N, _ = X.shape; plan = np.full((N, 3), -1, np.int32)
     if N < 2: return plan
     sub = X[np.unique(np.linspace(0, T - 1, min(T, nsub)).round().astype(int))]
-    pr = cKDTree(sub.mean(0)).query_pairs(rmax + 0.5, output_type="ndarray")
+    # candidate pairs from the first sampled frame (a bond like pair, spread < smax, is within rmax + 0.5 there; the mean
+    # structure of an unaligned, diffusing trajectory collapses and would give far too many candidates)
+    f0 = sub[0]; fin = np.isfinite(f0).all(-1); idx = np.where(fin)[0]
+    pr = idx[cKDTree(f0[fin]).query_pairs(rmax + 0.5, output_type="ndarray")] if len(idx) > 1 else np.zeros((0, 2), int)
     if len(pr) == 0: return plan
     d = np.linalg.norm(sub[:, pr[:, 0]] - sub[:, pr[:, 1]], axis=-1); dm, ds = d.mean(0), d.std(0)
     ok = np.isfinite(dm) & np.isfinite(ds) & (dm < rmax) & (ds < smax)
