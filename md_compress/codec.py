@@ -475,10 +475,11 @@ def _metadata(core, info, method, x_truth, groups, R, t_enc, threads, measure, i
 
 
 def compress(coords, aatype, atom_mask, chain_index, chain_break, bound=None, backbone="mean", full_predictor=False,
-             extra=None, extra_cls=None, threads=4, return_info=False, method="hybrid", _keep_rec=False, measure=True, metadata=True,
+             extra=None, extra_cls=None, threads=4, return_info=False, method="new-coder", _keep_rec=False, measure=True, metadata=True,
              _input=None, **opts):
     """atom14 protein trajectory -> .mdz bytes.
-    method 'hybrid' (default; bound default 0.1, backbone / full_predictor flags) or one of md_compress.methods.METHODS
+    method 'new-coder' (default; bound default 0.1 A, raw or mean predictor chosen per file by size), 'hybrid' (by name;
+    bound default 0.1, backbone / full_predictor flags) or one of md_compress.methods.METHODS
     ('xtc', 'tng', 'mdcompress', 'new-coder', 'lzma', 'zstd', 'bz2') with that method's options as keyword arguments
     (xtc_precision, tng_precision, mdc_res, mdc_level, mdc_preset, mdc_batch, mdc_history, nc_predictor, nc_coder, nc_sphere, nc_choose, level, delta).
     bound: Angstrom, 0 / 'lossless' (0.01 A grid), 'exact' (float32 bits; lzma / zstd / bz2 only) or None (method default)."""
@@ -608,7 +609,7 @@ def _load_atoms(top, traj, atoms="protein", **kw):
     return dict(x=x, groups=RP.groups_atom14(d.atom_mask, 0 if extra is None else extra.shape[1]), residues=int(len(d.aatype)), d=d, extra=extra)
 
 
-def compress_file(top, traj, out, bound=None, backbone="mean", full_predictor=False, threads=4, method="hybrid", atoms="protein",
+def compress_file(top, traj, out, bound=None, backbone="mean", full_predictor=False, threads=4, method="new-coder", atoms="protein",
                   method_opts=None, **kw):
     """topology + trajectory (any MDAnalysis format) -> .mdz file (with the metadata trailer; decompress_file writes it as JSON).
     atoms='protein' (default): protein heavy atoms in atom14 layout, OXT kept as extra atoms (required for 'hybrid').
@@ -697,7 +698,7 @@ def main(argv=None):
     sp = ap.add_subparsers(dest="cmd", required=True)
     c = sp.add_parser("compress", formatter_class=argparse.RawDescriptionHelpFormatter, epilog=methods_help())
     c.add_argument("--top", required=True); c.add_argument("--traj", required=True); c.add_argument("--out", required=True)
-    c.add_argument("--method", default="hybrid", choices=list(OPTS), help="compression method (default hybrid)")
+    c.add_argument("--method", default="new-coder", choices=list(OPTS), help="compression method (default new-coder; hybrid stays available by name)")
     c.add_argument("--bound", default=None, help="max abs error in Angstrom, 'lossless' (0.01 A grid) or 'exact' (lzma/zstd/bz2); default: method default")
     c.add_argument("--backbone", choices=["mean", "ae"], default="mean", help="hybrid: 'ae' = experimental backbone autoencoder")
     c.add_argument("--full-predictor", action="store_true", help="hybrid: rotamer codes + per trajectory MLP (report mode)")
@@ -710,7 +711,7 @@ def main(argv=None):
     g = c.add_argument_group("mdcompress"); g.add_argument("--mdc-res", type=int, help="resolution in fm (default 1000 = 0.01 A)")
     g.add_argument("--mdc-level", type=int, help="-l level (default 2)"); g.add_argument("--mdc-preset", choices=["default", "archive", "trajectory", "frames"])
     g.add_argument("--mdc-batch", type=int, help="-b frames per batch"); g.add_argument("--mdc-history", type=int, help="-h 1..3")
-    g = c.add_argument_group("new-coder"); g.add_argument("--nc-predictor", choices=["mean", "raw"]); g.add_argument("--nc-coder", choices=["ac", "lzma"])
+    g = c.add_argument_group("new-coder"); g.add_argument("--nc-predictor", choices=["auto", "mean", "raw"], help="auto (default): the smaller file of raw and mean"); g.add_argument("--nc-coder", choices=["ac", "lzma"])
     g.add_argument("--nc-sphere", choices=["auto", "off", "sphere", "circle"],
                    help="bond sphere prediction in the coder (blob version 5): auto (default; the smallest of off, sphere, sphere plus circle), off (version 4 as before), sphere, circle (sphere plus circle)")
     g.add_argument("--nc-choose", choices=["full", "sub"], help="nc-sphere auto: compare the modes on all frames (full) or on the first 128 frames and code only the winner (sub)")

@@ -35,6 +35,7 @@ def load(name, T):
 
 def roundtrip(d, bound, threads_dec=None, **kw):
     from md_compress.codec import compress, decompress
+    kw.setdefault("method", "hybrid")   # this helper tests the hybrid (no longer the default method)
     t0 = time.time(); blob, info = compress(d["coords"], d["aatype"], d["atom_mask"], d["chain_index"], d["chain_break"],
                                             bound=bound, extra=d["extra"], return_info=True, _keep_rec=True, **kw); te = time.time() - t0
     t0 = time.time(); r = decompress(blob); td = time.time() - t0
@@ -197,7 +198,7 @@ def run_methods(a):
             key = f"method/{n}/T{Tm}/{m} {json.dumps(o, sort_keys=True)} @ {b}"
             if key in out: continue
             if m == "hybrid" and not o:
-                res = roundtrip(d, b); res.update(method="hybrid", options={}, exact=False, pass_hyb=ok(res)); res["pass"] = res.pop("pass_hyb")
+                res = roundtrip(d, b, method="hybrid"); res.update(method="hybrid", options={}, exact=False, pass_hyb=ok(res)); res["pass"] = res.pop("pass_hyb")
             else:
                 res = method_roundtrip(d, m, b, o)
             out[key] = res; json.dump(out, open(out_p, "w"), indent=1)

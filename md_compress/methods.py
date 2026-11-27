@@ -13,8 +13,8 @@ payload in the .mdz container, whose header records the method id and its option
               mdc_preset (default, archive, trajectory, frames), mdc_batch (-b), mdc_history (-h, 1 to 3; 2 and 3
               crashed the v2.0.5 decoder in the benchmark).
   new-coder   model free quantisation + the context modelled arithmetic coder (gpu/residual_entropy.c), no network.
-              nc_predictor = 'mean' (default: mean structure after a per frame rigid fit) or 'raw' (coordinates
-              themselves; the coder's temporal context does the prediction). bound in Angstrom or lossless (0.01 A grid).
+              nc_predictor = 'auto' (default: codes with both and keeps the smaller file), 'mean' (mean structure after
+              a per frame rigid fit) or 'raw' (coordinates themselves; the coder's temporal context does the prediction). bound in Angstrom or lossless (0.01 A grid).
               nc_sphere = 'auto' (default: the coder picks the smallest of off, sphere and sphere plus circle per file),
               'off' (coder blob version 4, as before), 'sphere' or 'circle' (sphere plus circle): the last coded axis of an
               atom is predicted from the sphere around a bonded neighbour (neighbours found from the coordinates and stored),
@@ -266,13 +266,19 @@ def dec_generic(name, data, T, N, opts, threads=4):
 
 
 # ---------------------------------------------------------------- model free + new coder
-def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_sphere="auto", nc_choose="full", **_):
+def enc_newcoder(x, cls, E, bound=None, nc_predictor="auto", nc_coder="ac", nc_sphere="auto", nc_choose="full", **_):
+    if nc_predictor == "auto":   # default: code with both predictors and keep the smaller file (the options differ only in the name)
+        import json
+        rs = [enc_newcoder(x, cls, E, bound, p, nc_coder, nc_sphere, nc_choose) for p in ("raw", "mean")]
+        size = lambda r: len(r[0]) + len(json.dumps({k: v for k, v in r[1].items() if not k.startswith("_")}))
+        data, used, b = min(rs, key=size); used["_nc_predictor_sizes"] = {r[1]["nc_predictor"]: size(r) for r in rs}
+        return data, used, b
     from md_compress import codec as C
     RCD, RE = E["RCD"], E["RE"]
     kind, b = _bound(bound)
     if kind is None: kind, b = "grid", 0.1
     if kind == "exact": raise ValueError("new-coder is grid based; use a bound or lossless (0.01 A grid)")
-    if nc_predictor not in ("mean", "raw"): raise ValueError("nc_predictor must be 'mean' or 'raw'")
+    if nc_predictor not in ("mean", "raw"): raise ValueError("nc_predictor must be 'auto', 'mean' or 'raw'")
     if nc_sphere not in ("auto", "off", "sphere", "circle"): raise ValueError("nc_sphere must be 'auto', 'off', 'sphere' or 'circle'")
     if nc_choose not in ("full", "sub"): raise ValueError("nc_choose must be 'full' or 'sub'")
     import torch

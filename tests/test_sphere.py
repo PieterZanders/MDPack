@@ -97,6 +97,23 @@ def test_auto_never_larger_than_off():
     assert len(seen) == 1 and np.allclose(seen[0], x, atol=1e-6)   # the originals, not the 1 A grid positions
 
 
+def test_default_method_new_coder():
+    """new-coder is the default method, with raw or mean chosen per file by size; existing hybrid files still decode and
+    the hybrid is still available by name."""
+    from md_compress.codec import compress, decompress
+    r = decompress(open(f"{FIX}/legacy_1e8rA00_T20_hybrid.mdz", "rb").read(), 1, report=False)   # an old hybrid file
+    assert r["coords"].shape[0] == 20
+    a = (r["coords"], r["aatype"], r["atom_mask"], r["chain_index"], r["chain_break"]); kw = dict(extra=r.get("extra"), threads=1, metadata=False)
+    blob, info = compress(*a, return_info=True, **kw)
+    assert info["method"] == "new-coder" and info["options"]["nc_predictor"] in ("raw", "mean")
+    sizes = {p: len(compress(*a, method="new-coder", nc_predictor=p, **kw)) for p in ("raw", "mean")}
+    assert len(blob) == min(sizes.values()) and info["options"]["nc_predictor"] == min(sizes, key=sizes.get)
+    d = decompress(blob, 1, report=False); mk = np.asarray(r["atom_mask"]) > 0
+    assert np.abs(d["coords"][:, mk].astype(np.float64) - r["coords"][:, mk]).max() <= 0.1 + 1e-5
+    h = compress(*a, method="hybrid", **kw); dh = decompress(h, 1, report=False)
+    assert np.abs(dh["coords"][:, mk].astype(np.float64) - r["coords"][:, mk]).max() <= 0.1 + 1e-5
+
+
 def _files(tmp, T=40):
     import MDAnalysis as mda, warnings
     warnings.filterwarnings("ignore")
