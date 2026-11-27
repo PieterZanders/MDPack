@@ -81,10 +81,10 @@ for sysn in [x for x in a.systems.split(",") if x not in EXCLUDE]:
                     else:
                         t0 = time.perf_counter(); r = C.decompress(blob, a.threads, report=False); td = time.perf_counter() - t0
                         x, y = flat(d, r); err = float(np.abs(y.astype(np.float64) - x).max())
+                    ch = dict(info.get("options") or {}, **(info.get("choice") or {}))
                     rec.update(bytes=len(blob), raw_bytes=12 * x.shape[0] * x.shape[1], ratio=12 * x.shape[0] * x.shape[1] / len(blob),
                                encode_s=te, decode_s=td, max_err=err, within=bool(err <= lim + 1e-5), N=int(x.shape[1]),
-                               smode=(info.get("options") or {}).get("_nc_smode"), smode_sizes=(info.get("options") or {}).get("_nc_smode_sizes"),
-                               diag=(info.get("options") or {}).get("_nc_diag"))
+                               smode=ch.get("_nc_smode"), smode_sizes=ch.get("_nc_smode_sizes"), diag=ch.get("_nc_diag"))
                     if mname.startswith("nc_"):
                         dec[(bd, mname)] = y
                         if mname.endswith("_auto") and (bd, mname.replace("auto", "off")) in dec:

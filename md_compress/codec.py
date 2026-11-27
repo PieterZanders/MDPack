@@ -438,11 +438,12 @@ def _container(method, kind, x, cls, bound, threads, opts, topo=None, R=0, Mx=0,
     data, used, maxerr = _encode_method(method, x, cls, bound, threads, opts, top_arrays)
     used["bound"] = maxerr; used.update(meta or {})
     W = _W(); W.b.write(MAGIC + struct.pack(_HDR2, 2, MT.METHODS[method], kind, T, N, np.nan if maxerr is None else maxerr))
-    W.sec(json.dumps({k: v for k, v in used.items() if not k.startswith("_")}).encode())   # '_' keys: in memory only
+    choice = {k: used.pop(k) for k in [k for k in used if k.startswith("_")]}   # '_' keys: encoder choices, in memory only
+    W.sec(json.dumps(used).encode())
     if kind == 0: W.b.write(struct.pack("<HI", R, Mx)); W.sec(topo)
     W.sec(data)
     out = W.b.getvalue()
-    info = dict(method=method, options=used, bound=maxerr, payload=len(data), total=len(out), raw_float32=12 * N * T, ratio=12 * N * T / len(out))
+    info = dict(method=method, options=used, bound=maxerr, payload=len(data), total=len(out), raw_float32=12 * N * T, ratio=12 * N * T / len(out), choice=choice)
     info["breakdown"] = dict(header_options_topology=len(out) - len(data) - 4, payload=len(data) + 4,
                              **{k: used[k] for k in ("decoder_bytes", "latent_bytes") if k in used})
     return out, info
