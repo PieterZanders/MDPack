@@ -266,6 +266,16 @@ def dec_generic(name, data, T, N, opts, threads=4):
 
 
 # ---------------------------------------------------------------- model free + new coder
+def sphere_option_bytes(nc_sphere="auto"):
+    """upper bound on the bytes a sphere mode adds outside the coder blob: the nc_sphere / nc_smode option fields in the
+    container header (json) plus the same fields in the metadata trailer (counted uncompressed), plus 8 bytes of slack for
+    zlib and run to run trailer variation. nc_sphere auto uses it so that a whole file is never larger than with off."""
+    import json
+    u0 = dict(nc_predictor="raw", nc_coder="ac", kind="lossless"); u1 = dict(u0, nc_sphere=nc_sphere, nc_smode="circle")
+    core = len(json.dumps(u1)) - len(json.dumps(u0)); trailer = len(json.dumps(u1, separators=(",", ":"))) - len(json.dumps(u0, separators=(",", ":")))
+    return core + trailer + 8
+
+
 def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_sphere="auto", **_):
     from md_compress import codec as C
     RCD, RE = E["RCD"], E["RE"]
@@ -290,7 +300,8 @@ def enc_newcoder(x, cls, E, bound=None, nc_predictor="mean", nc_coder="ac", nc_s
     if nc_coder == "lzma":  # the report's 'model free mean' / 'model free raw' rows (best lzma arrangement per stream)
         blob = C._lz_enc(RCD, q); qd = C._lz_dec(RCD, blob, q.shape)
     elif nc_coder == "ac":
-        blob, inf = RE.encode(q, cls, base, st, RE.make_refs(Mnp), RE.make_refs3(Mnp, None), None, sphere=nc_sphere); qd = RE.decode(blob, q.shape, cls, base, st, None)
+        blob, inf = RE.encode(q, cls, base, st, RE.make_refs(Mnp), RE.make_refs3(Mnp, None), None, sphere=nc_sphere,
+                              margin=sphere_option_bytes(nc_sphere) if nc_sphere == "auto" else 0); qd = RE.decode(blob, q.shape, cls, base, st, None)
     else: raise ValueError("nc_coder must be 'ac' or 'lzma'")
     if not np.array_equal(qd, q): raise RuntimeError("coder roundtrip mismatch")
     W.sec(blob)

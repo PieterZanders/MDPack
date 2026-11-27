@@ -162,14 +162,15 @@ def _cost(e):
     return np.log2(1.0 + np.abs(e)).sum()
 
 
-def encode(q, cls, base, s, ref, R3, Xc=None, n_try=3, force=None, sphere="off", plan=None):
+def encode(q, cls, base, s, ref, R3, Xc=None, n_try=3, force=None, sphere="off", plan=None, margin=0):
     """q int [T,N,3] residual integers of a stream with float base predictor `base` and step s (x_rec = base + s q).
     Returns (blob, info). Candidate predictors are scored per atom class with a code length proxy; the best per class
     combination and the best global candidates are entropy coded and the smallest is kept.
     sphere: 'off' (version 4, unchanged), 'sphere' or 'circle' (sphere plus circle; forced, version 5) or 'auto' (the
     smallest of off, sphere and sphere plus circle, each coded with the predictor chosen with the sphere off; a file is
     never larger than with 'off'). Forced modes fall back to version 4 only when no atom has a neighbour or T < 2. plan: [N,3] (B, C, cur) bonded neighbours, default
-    bond_plan() of the reconstructed positions; stored in the blob."""
+    bond_plan() of the reconstructed positions; stored in the blob. margin: bytes the caller adds outside the blob when a
+    sphere mode is used (container option fields); auto keeps a sphere mode only if it is smaller than off by more than that."""
     q = np.ascontiguousarray(q, np.int32); T, N, _ = q.shape
     ref = np.ascontiguousarray(ref, np.int32); cls = np.ascontiguousarray(cls, np.uint8); R3 = np.ascontiguousarray(R3, np.int32)
     assert len(ref) == N == len(cls) == len(R3) and (ref < np.arange(N)).all() and cls.max(initial=0) < NG
@@ -222,7 +223,7 @@ def encode(q, cls, base, s, ref, R3, Xc=None, n_try=3, force=None, sphere="off",
         sm = SMODES[nm]; b5 = _enc(q, ref, cls, W, base, s, xc, Nc, R3.reshape(-1), sm, P, rbq.astype(np.float64) * 1e-3, ctq.astype(np.float64) * 1e-4)
         h5 = bytes([VERSION_SPHERE]) + hdr0 + bytes([sm]) + hp + (_pack(ctq, np.int16) if sm == 2 else b"")
         sizes_m[nm] = len(h5) + len(b5)
-        if sphere != "auto" or len(h5) + len(b5) < len(out[0]): out = (h5 + b5, dict(out[1], header_bytes=len(h5), smode=nm))
+        if sphere != "auto" or len(h5) + len(b5) + margin < (len(out[0]) if out[1]["smode"] == "off" else len(out[0]) + margin): out = (h5 + b5, dict(out[1], header_bytes=len(h5), smode=nm))
     out[1]["smode_sizes"] = sizes_m
     return out
 
