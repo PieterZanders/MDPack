@@ -52,23 +52,25 @@ python -m md_compress.codec decompress --in traj.mdz --top system.pdb --out reco
 
 The entry point is `md_compress/codec.py`. It writes a self describing `.mdz` file. The method, its options, the error bound and the topology are in the header, so `decompress` needs no method flags.
 
-The default method is `hybrid`: the backbone (N, CA, C, O) and any extra atoms are coded against the trajectory mean structure after a per frame rigid fit; side chains are predicted by the shared pretrained packer from the decoded backbone (no rotamer codes, no per trajectory MLP); both residual streams go through the context modelled coder in `gpu/residual_entropy.c`. Every atom is kept within the bound.
+The default method is `new-coder`: no AI model; the coordinates (raw predictor) or their residuals against the trajectory mean structure after a per frame rigid fit (mean predictor) are quantised to the bound and coded by the context modelled coder in `gpu/residual_entropy.c`, with the bond sphere prediction described below. The encoder codes the file with both predictors and keeps the smaller one. Every atom is kept within the bound. Before this, the default was `hybrid`, which stays available with `--method hybrid` (and `method="hybrid"` in Python); existing hybrid files decode unchanged.
+
+The `hybrid` method: the backbone (N, CA, C, O) and any extra atoms are coded against the trajectory mean structure after a per frame rigid fit; side chains are predicted by the shared pretrained packer from the decoded backbone (no rotamer codes, no per trajectory MLP); both residual streams go through the context modelled coder in `gpu/residual_entropy.c`. Every atom is kept within the bound.
 
 ```bash
 python -m md_compress.codec compress   --top system.pdb --traj traj.xtc --out traj.mdz --bound 0.1
 python -m md_compress.codec compress   --top system.pdb --traj traj.xtc --out traj.mdz --bound lossless
-python -m md_compress.codec compress   --top system.pdb --traj traj.xtc --out traj.mdz --bound 0.5 --backbone ae
-python -m md_compress.codec compress   --top system.pdb --traj traj.xtc --out traj.mdz --bound 0.1 --full-predictor
+python -m md_compress.codec compress   --top system.pdb --traj traj.xtc --out traj.mdz --bound 0.5 --method hybrid --backbone ae
+python -m md_compress.codec compress   --top system.pdb --traj traj.xtc --out traj.mdz --bound 0.1 --method hybrid --full-predictor
 python -m md_compress.codec decompress --in traj.mdz --top system.pdb --out recon.dcd
 ```
 
 ```python
 from md_compress.codec import compress, decompress
 
-blob = compress(coords, aatype, atom_mask, chain_index, chain_break, bound=0.1)  # coords [T, R, 14, 3] in Angstrom
-blob = compress(coords, aatype, atom_mask, chain_index, chain_break, bound="lossless", backbone="ae",
+blob = compress(coords, aatype, atom_mask, chain_index, chain_break, bound=0.1)  # new-coder; coords [T, R, 14, 3] in Angstrom
+blob = compress(coords, aatype, atom_mask, chain_index, chain_break, bound="lossless", method="hybrid", backbone="ae",
                 full_predictor=False, extra=extra_xyz)  # optional extra atoms [T, M, 3], coded with the backbone
-r = decompress(blob)  # dict: coords, extra, aatype, atom_mask, chain_index, chain_break, bound, backbone, full_predictor, report
+r = decompress(blob)  # dict: coords, extra, aatype, atom_mask, chain_index, chain_break, bound, report (hybrid files also backbone, full_predictor)
 blob, info = compress(..., return_info=True)  # info: size breakdown and options
 ```
 
@@ -85,14 +87,14 @@ The decoder recomputes packer (and autoencoder) predictions on a fixed single to
 
 ## Methods
 
-`--method` selects the coder (default `hybrid`). Every method writes the same `.mdz` container. A flag that does not belong to the chosen method is rejected. `python -m md_compress.codec list-methods` prints the list and flags.
+`--method` selects the coder (default `new-coder`). Every method writes the same `.mdz` container. A flag that does not belong to the chosen method is rejected. `python -m md_compress.codec list-methods` prints the list and flags.
 
 | method | what it stores | flags | error kind |
 |---|---|---|---|
-| `hybrid` (default) | mean structure backbone, shared packer side chains, residuals, context modelled coder | `--bound B\|lossless` (default 0.1), `--backbone mean\|ae`, `--full-predictor`, `--coder ac\|lzma`, `--no-residuals`, `--angle-model mean\|vonmises\|empirical\|gaussian` | bounded (max B Angstrom); lossless uses the 0.01 Angstrom grid |
+| `hybrid` | mean structure backbone, shared packer side chains, residuals, context modelled coder | `--bound B\|lossless` (default 0.1), `--backbone mean\|ae`, `--full-predictor`, `--coder ac\|lzma`, `--no-residuals`, `--angle-model mean\|vonmises\|empirical\|gaussian` | bounded (max B Angstrom); lossless uses the 0.01 Angstrom grid |
 | `hybrid-ae` | as `hybrid`, with the backbone from the shared backbone autoencoder | same as `hybrid` | bounded or lossless, as `hybrid` |
 | `model-only` | autoencoder latents, rotamer codes, per trajectory MLP, no residuals | `--angle-model` | no limit (RMSD and maximum error are reported) |
-| `new-coder` | raw coordinates or mean structure residuals, no AI model | `--bound B\|lossless`, `--nc-predictor mean\|raw`, `--nc-coder ac\|lzma` | bounded or lossless |
+| `new-coder` (default) | raw coordinates or mean structure residuals, no AI model, bond sphere prediction in the coder | `--bound B\|lossless` (default 0.1), `--nc-predictor auto\|mean\|raw` (default auto: the smaller file), `--nc-coder ac\|lzma`, `--nc-sphere auto\|off\|sphere\|circle` (default auto), `--nc-choose full\|sub` (default full) | bounded or lossless |
 | `xtc` | GROMACS XTC | `--xtc-precision P` (1/nm, default 1000) or `--bound B` (P = 5/B) | bounded (max 5/P Angstrom) |
 | `tng` | GROMACS TNG, via `gmx trjconv` | `--tng-precision P` (power of ten, default 1000) or `--bound B` | bounded (max 5/P Angstrom) |
 | `trr` | GROMACS TRR, uncompressed | `--trr-double` (float64) | exact |
@@ -135,6 +137,17 @@ blob = compress(coords, aatype, atom_mask, chain_index, chain_break, method="mdc
 blob, info = compress(coords, aatype, atom_mask, chain_index, chain_break, method="cg2all", return_info=True)
 blob = compress_xyz(xyz, method="zstd", bound="exact", level=22)  # any atoms [T, N, 3]; decompress(blob)["xyz"]
 ```
+
+### new-coder file format: coder blob versions 4 and 5
+
+The new-coder payload holds the predictor data (mean predictor: mean structure, per frame rotation quaternions and translations, float32) and one coder blob. The first byte of the blob is its version:
+
+* Version 4 (sphere off, unchanged): the per atom class linear predictor weights (16 classes, 4 int16 each), the reference atom offsets (lzma) and the three spatial neighbours per atom (lzma), then the arithmetic coded integers.
+* Version 5 (bond sphere): the version 4 header, then one byte for the mode (1 sphere, 2 sphere plus circle), the bond plan per atom (offsets to the bonded neighbour B and to a second atom C, and whether C is taken from the current frame; int32, lzma), the mean bond lengths |x − B| (uint16, 0.001 Angstrom, lzma) and, for mode 2, the cosine of the mean angle at B (int16, 1e−4, lzma), then the arithmetic coded integers.
+
+In mode 1, for every atom with a bonded neighbour B coded earlier in the same frame, the coordinate axis with the largest predicted offset from B is coded last and predicted from the sphere of the stored bond length around B, using the two axes already decoded. In mode 2 the middle axis is also predicted, from the circle given by the stored bond length and angle. Only addition, subtraction, multiplication, division and square root are used; when the square root argument is not positive, or a value is not finite, the atom falls back to the version 4 prediction, so a NaN never becomes an integer. The coder must be compiled with `-ffp-contract=off -fno-fast-math` (the build in `gpu/residual_entropy.py` does this); the portability check decoded identically with gcc and clang at -O0 to -O3 (also -march=native) and on aarch64 under qemu.
+
+The encoder chooses the bonds from the original coordinates (for each atom the earlier atom whose distance varies least over the trajectory, among pairs with mean distance below 2.1 Angstrom and spread below 0.12 Angstrom) and stores them, so no topology is needed and the decoder does not depend on how they were found. With `--nc-sphere auto` it codes the file with the sphere off, then with sphere and sphere plus circle using the same predictor, and keeps the smallest blob. The mode is not written to the container options (the blob version carries it), so the container and the metadata trailer are the same for every mode and an auto file is never larger than with the sphere off. `--nc-choose sub` compares the modes on the first 128 frames only; it is faster but did not pick the same mode as the full comparison on every benchmark file, so `full` is the default.
 
 ## JSON report
 
